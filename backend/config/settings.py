@@ -13,7 +13,12 @@ class Settings(BaseSettings):
     DEBUG: bool = True
     
     # CORS settings
-    CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://localhost:5173"]
+    CORS_ORIGINS: list[str] = [
+        "http://localhost:3000", 
+        "http://localhost:5173",
+        "https://exercise-form-correction.vercel.app",
+        "https://*.vercel.app",
+    ]
     
     # Upload settings
     UPLOAD_DIR: str = "./uploads"

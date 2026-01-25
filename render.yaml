@@ -1,0 +1,21 @@
+# Render Blueprint for Exercise Form Correction Backend
+# https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: exercise-form-backend
+    runtime: python
+    plan: free
+    region: singapore
+    branch: main
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+      - key: DEBUG
+        value: "false"
+      - key: CORS_ORIGINS
+        value: "https://exercise-form-correction.vercel.app,https://*.vercel.app"

@@ -5,6 +5,7 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { PoseLandmark } from '../pose';
+import { WS_URL } from '../config';
 
 export interface FormCorrectionResponse {
   state: 'idle' | 'scanning' | 'active';
@@ -42,7 +43,7 @@ export interface UsePoseStreamReturn {
   reset: () => Promise<void>;
 }
 
-const DEFAULT_WS_URL = 'ws://localhost:8000/api/ws/pose';
+const DEFAULT_WS_URL = WS_URL;
 
 // Generate stable client ID once
 const stableClientId = `client_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
