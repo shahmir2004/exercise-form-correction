@@ -14,7 +14,10 @@ from .base import (
 
 
 class BicepCurlModule(BaseExercise):
-    """Bicep curl exercise detection and form correction."""
+    """Bicep curl exercise detection and form correction.
+    
+    Supports both standing and seated bicep curls.
+    """
     
     # Form thresholds - IMPROVED for better detection
     MIN_ELBOW_ANGLE = 50   # Was 30 - top of curl (more forgiving)
@@ -33,6 +36,12 @@ class BicepCurlModule(BaseExercise):
     SMOOTHING_WINDOW = 5   # Number of frames for angle smoothing
     MIN_FRAMES_TO_CONFIRM = 3  # Frames needed to confirm state change
     
+    # Seated detection
+    SEATED_HIP_ANGLE_MIN = 70   # Hip angle when seated (bent at hips)
+    SEATED_HIP_ANGLE_MAX = 120  # 
+    SEATED_KNEE_ANGLE_MIN = 60  # Knee angle when seated
+    SEATED_KNEE_ANGLE_MAX = 110 #
+    
     def __init__(self):
         super().__init__()
         self._lowest_elbow_angle = 180.0
@@ -41,6 +50,7 @@ class BicepCurlModule(BaseExercise):
         self._initial_shoulder_x: Optional[float] = None
         self._initial_shoulder_y: Optional[float] = None
         self._active_arm: Optional[str] = None  # "left", "right", or "both"
+        self._is_seated: bool = False  # Track if user is seated
         
         # Smoothing buffers for angle readings
         self._left_elbow_buffer: deque = deque(maxlen=self.SMOOTHING_WINDOW)
@@ -50,6 +60,9 @@ class BicepCurlModule(BaseExercise):
         self._curl_confirm_count = 0
         self._extend_confirm_count = 0
         self._pending_state_change: Optional[str] = None
+        
+        # Seated detection buffer
+        self._seated_frame_count = 0
     
     @property
     def name(self) -> str:
@@ -66,7 +79,66 @@ class BicepCurlModule(BaseExercise):
             JointName.RIGHT_WRIST,
             JointName.LEFT_HIP,
             JointName.RIGHT_HIP,
+            JointName.LEFT_KNEE,
+            JointName.RIGHT_KNEE,
         ]
+    
+    def _detect_seated_position(self, landmarks: dict[JointName, Landmark]) -> bool:
+        """Detect if user is in a seated position.
+        
+        Seated indicators:
+        - Hip angle is bent (not straight like standing)
+        - Knee angle is around 90 degrees
+        - Hip Y position is lower relative to knee (sitting)
+        """
+        try:
+            # Calculate hip angle (shoulder-hip-knee)
+            left_hip_angle = calculate_angle(
+                landmarks[JointName.LEFT_SHOULDER],
+                landmarks[JointName.LEFT_HIP],
+                landmarks[JointName.LEFT_KNEE]
+            )
+            right_hip_angle = calculate_angle(
+                landmarks[JointName.RIGHT_SHOULDER],
+                landmarks[JointName.RIGHT_HIP],
+                landmarks[JointName.RIGHT_KNEE]
+            )
+            avg_hip_angle = (left_hip_angle + right_hip_angle) / 2
+            
+            # Calculate knee angle
+            left_knee_angle = calculate_angle(
+                landmarks[JointName.LEFT_HIP],
+                landmarks[JointName.LEFT_KNEE],
+                landmarks[JointName.LEFT_ANKLE] if JointName.LEFT_ANKLE in landmarks else landmarks[JointName.LEFT_KNEE]
+            )
+            right_knee_angle = calculate_angle(
+                landmarks[JointName.RIGHT_HIP],
+                landmarks[JointName.RIGHT_KNEE],
+                landmarks[JointName.RIGHT_ANKLE] if JointName.RIGHT_ANKLE in landmarks else landmarks[JointName.RIGHT_KNEE]
+            )
+            avg_knee_angle = (left_knee_angle + right_knee_angle) / 2
+            
+            # Check seated criteria
+            hip_bent = self.SEATED_HIP_ANGLE_MIN < avg_hip_angle < self.SEATED_HIP_ANGLE_MAX
+            knee_bent = self.SEATED_KNEE_ANGLE_MIN < avg_knee_angle < self.SEATED_KNEE_ANGLE_MAX
+            
+            # Also check relative positions - when seated, hips are at similar height to knees
+            hip_y = (landmarks[JointName.LEFT_HIP].y + landmarks[JointName.RIGHT_HIP].y) / 2
+            knee_y = (landmarks[JointName.LEFT_KNEE].y + landmarks[JointName.RIGHT_KNEE].y) / 2
+            hips_near_knees = abs(hip_y - knee_y) < 0.15  # Close vertical position
+            
+            is_seated = (hip_bent or knee_bent) and hips_near_knees
+            
+            # Use frame counter for stability
+            if is_seated:
+                self._seated_frame_count = min(self._seated_frame_count + 1, 10)
+            else:
+                self._seated_frame_count = max(self._seated_frame_count - 1, 0)
+            
+            return self._seated_frame_count >= 5
+            
+        except (KeyError, TypeError):
+            return False
     
     def _calculate_angles(self, landmarks: dict[JointName, Landmark]) -> JointAngles:
         """Calculate all relevant joint angles for bicep curl analysis with smoothing."""
@@ -283,13 +355,19 @@ class BicepCurlModule(BaseExercise):
                 return "up"
     
     def check_form(self, landmarks: dict[JointName, Landmark]) -> ExerciseResult:
-        """Analyze bicep curl form and return corrections."""
+        """Analyze bicep curl form and return corrections.
+        
+        Supports both standing and seated bicep curls.
+        """
         violations = []
         corrections = []
         joint_colors = {}
         
         # Calculate angles
         angles = self._calculate_angles(landmarks)
+        
+        # Detect if user is seated
+        self._is_seated = self._detect_seated_position(landmarks)
         
         # Initialize all tracked joints as green
         for joint in self.required_joints:
@@ -328,12 +406,14 @@ class BicepCurlModule(BaseExercise):
             joint_colors[JointName.RIGHT_ELBOW.value] = "red"
             is_valid = False
         
-        # Check body swing
+        # Check body swing - less strict for seated (upper body can move slightly)
+        swing_threshold = self.BODY_SWING_THRESHOLD * 1.5 if self._is_seated else self.BODY_SWING_THRESHOLD
         if self._check_body_swing(landmarks):
-            violations.append("Body swinging for momentum")
-            corrections.append("Keep your torso still - use only your biceps")
-            joint_colors[JointName.LEFT_SHOULDER.value] = "yellow"
-            joint_colors[JointName.RIGHT_SHOULDER.value] = "yellow"
+            if not self._is_seated:  # Only warn for standing
+                violations.append("Body swinging for momentum")
+                corrections.append("Keep your torso still - use only your biceps")
+                joint_colors[JointName.LEFT_SHOULDER.value] = "yellow"
+                joint_colors[JointName.RIGHT_SHOULDER.value] = "yellow"
             # Update reference position
             self._initial_shoulder_x = None
         
@@ -392,8 +472,10 @@ class BicepCurlModule(BaseExercise):
         self._initial_shoulder_x = None
         self._initial_shoulder_y = None
         self._active_arm = None
+        self._is_seated = False
         self._left_elbow_buffer.clear()
         self._right_elbow_buffer.clear()
         self._curl_confirm_count = 0
         self._extend_confirm_count = 0
         self._pending_state_change = None
+        self._seated_frame_count = 0
