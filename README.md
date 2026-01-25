@@ -426,12 +426,17 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ---
 
-## 👤 Author
+## 👤 Authors
 
 **Muhammad Shahmir Ahmed**
+**Abdullah Azher Chaudry**
 
 - GitHub: [@shahmir2004](https://github.com/shahmir2004)
 - Portfolio: [shahmir-ahmed.vercel.app](https://shahmir-ahmed.vercel.app)
+
+- GitHub: [@ABDULLAHAZHERCH](https://github.com/ABDULLAHAZHERCH)
+- Portfolio: [abdullahch.vercel.app](https://abdullahch.vercel.app/)
+
 
 ---
 
