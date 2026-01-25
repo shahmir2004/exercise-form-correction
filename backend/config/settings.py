@@ -9,8 +9,12 @@ def get_cors_origins() -> List[str]:
     """Parse CORS_ORIGINS from environment or return defaults."""
     env_value = os.environ.get('CORS_ORIGINS', '')
     if env_value:
+        # Special case: allow all origins
+        if env_value.strip() == '*':
+            return ["*"]
         return [origin.strip() for origin in env_value.split(',') if origin.strip()]
     return [
+        "*",  # Allow all origins for development
         "http://localhost:3000", 
         "http://localhost:5173",
         "https://exercise-form-correction.vercel.app",
