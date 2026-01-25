@@ -1,7 +1,8 @@
 """Application settings with environment variable support."""
 
-from typing import Optional
+from typing import Optional, Union
 from pydantic_settings import BaseSettings
+from pydantic import field_validator
 
 
 class Settings(BaseSettings):
@@ -12,13 +13,21 @@ class Settings(BaseSettings):
     PORT: int = 8000
     DEBUG: bool = True
     
-    # CORS settings
+    # CORS settings - accepts comma-separated string or JSON array
     CORS_ORIGINS: list[str] = [
         "http://localhost:3000", 
         "http://localhost:5173",
         "https://exercise-form-correction.vercel.app",
         "https://*.vercel.app",
     ]
+    
+    @field_validator('CORS_ORIGINS', mode='before')
+    @classmethod
+    def parse_cors_origins(cls, v):
+        """Parse CORS_ORIGINS from comma-separated string or list."""
+        if isinstance(v, str):
+            return [origin.strip() for origin in v.split(',') if origin.strip()]
+        return v
     
     # Upload settings
     UPLOAD_DIR: str = "./uploads"
