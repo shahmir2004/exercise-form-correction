@@ -1,0 +1,399 @@
+"""Bicep curl exercise module with form correction."""
+
+from typing import Optional
+from collections import deque
+import numpy as np
+from .base import (
+    BaseExercise,
+    ExerciseResult,
+    JointAngles,
+    JointName,
+    Landmark,
+    calculate_angle,
+)
+
+
+class BicepCurlModule(BaseExercise):
+    """Bicep curl exercise detection and form correction."""
+    
+    # Form thresholds - IMPROVED for better detection
+    MIN_ELBOW_ANGLE = 50   # Was 30 - top of curl (more forgiving)
+    MAX_ELBOW_ANGLE = 145  # Was 160 - bottom of curl (more forgiving)
+    
+    # Hysteresis to prevent flickering between states
+    ANGLE_HYSTERESIS = 15  # Degrees of buffer
+    
+    # Form thresholds - slightly relaxed for real-world conditions
+    ELBOW_DRIFT_THRESHOLD = 0.06  # Was 0.03 - normalized X difference
+    BODY_SWING_THRESHOLD = 0.04   # Was 0.02 - allowed shoulder movement
+    WRIST_CURL_THRESHOLD = 20     # Wrist angle deviation
+    
+    # Detection settings
+    MIN_VISIBILITY = 0.3   # Lowered from implicit 0.5
+    SMOOTHING_WINDOW = 5   # Number of frames for angle smoothing
+    MIN_FRAMES_TO_CONFIRM = 3  # Frames needed to confirm state change
+    
+    def __init__(self):
+        super().__init__()
+        self._lowest_elbow_angle = 180.0
+        self._highest_elbow_angle = 0.0
+        self._in_curl = False
+        self._initial_shoulder_x: Optional[float] = None
+        self._initial_shoulder_y: Optional[float] = None
+        self._active_arm: Optional[str] = None  # "left", "right", or "both"
+        
+        # Smoothing buffers for angle readings
+        self._left_elbow_buffer: deque = deque(maxlen=self.SMOOTHING_WINDOW)
+        self._right_elbow_buffer: deque = deque(maxlen=self.SMOOTHING_WINDOW)
+        
+        # State confirmation counters
+        self._curl_confirm_count = 0
+        self._extend_confirm_count = 0
+        self._pending_state_change: Optional[str] = None
+    
+    @property
+    def name(self) -> str:
+        return "Bicep Curl"
+    
+    @property
+    def required_joints(self) -> list[JointName]:
+        return [
+            JointName.LEFT_SHOULDER,
+            JointName.RIGHT_SHOULDER,
+            JointName.LEFT_ELBOW,
+            JointName.RIGHT_ELBOW,
+            JointName.LEFT_WRIST,
+            JointName.RIGHT_WRIST,
+            JointName.LEFT_HIP,
+            JointName.RIGHT_HIP,
+        ]
+    
+    def _calculate_angles(self, landmarks: dict[JointName, Landmark]) -> JointAngles:
+        """Calculate all relevant joint angles for bicep curl analysis with smoothing."""
+        angles = JointAngles()
+        
+        # Check visibility before calculating
+        left_visible = self._check_arm_visibility(landmarks, "left")
+        right_visible = self._check_arm_visibility(landmarks, "right")
+        
+        # Left elbow angle (shoulder-elbow-wrist) with smoothing
+        if left_visible:
+            raw_left = calculate_angle(
+                landmarks[JointName.LEFT_SHOULDER],
+                landmarks[JointName.LEFT_ELBOW],
+                landmarks[JointName.LEFT_WRIST]
+            )
+            self._left_elbow_buffer.append(raw_left)
+            angles.left_elbow = sum(self._left_elbow_buffer) / len(self._left_elbow_buffer)
+        else:
+            angles.left_elbow = 180.0  # Default extended
+        
+        # Right elbow angle with smoothing
+        if right_visible:
+            raw_right = calculate_angle(
+                landmarks[JointName.RIGHT_SHOULDER],
+                landmarks[JointName.RIGHT_ELBOW],
+                landmarks[JointName.RIGHT_WRIST]
+            )
+            self._right_elbow_buffer.append(raw_right)
+            angles.right_elbow = sum(self._right_elbow_buffer) / len(self._right_elbow_buffer)
+        else:
+            angles.right_elbow = 180.0  # Default extended
+        
+        # Shoulder angles for detecting arm raise (shoulder-hip-knee equivalent)
+        angles.left_shoulder = calculate_angle(
+            landmarks[JointName.LEFT_ELBOW],
+            landmarks[JointName.LEFT_SHOULDER],
+            landmarks[JointName.LEFT_HIP]
+        )
+        
+        angles.right_shoulder = calculate_angle(
+            landmarks[JointName.RIGHT_ELBOW],
+            landmarks[JointName.RIGHT_SHOULDER],
+            landmarks[JointName.RIGHT_HIP]
+        )
+        
+        self._last_angles = angles
+        return angles
+    
+    def _check_arm_visibility(self, landmarks: dict[JointName, Landmark], side: str) -> bool:
+        """Check if arm landmarks are visible enough for detection."""
+        if side == "left":
+            joints = [JointName.LEFT_SHOULDER, JointName.LEFT_ELBOW, JointName.LEFT_WRIST]
+        else:
+            joints = [JointName.RIGHT_SHOULDER, JointName.RIGHT_ELBOW, JointName.RIGHT_WRIST]
+        
+        return all(landmarks[j].visibility > self.MIN_VISIBILITY for j in joints)
+    
+    def _detect_active_arm(self, landmarks: dict[JointName, Landmark]) -> str:
+        """Detect which arm(s) are performing the curl."""
+        angles = self._last_angles or self._calculate_angles(landmarks)
+        
+        left_visible = self._check_arm_visibility(landmarks, "left")
+        right_visible = self._check_arm_visibility(landmarks, "right")
+        
+        # If only one arm is visible, use that one
+        if left_visible and not right_visible:
+            return "left"
+        if right_visible and not left_visible:
+            return "right"
+        if not left_visible and not right_visible:
+            return "both"  # Fallback
+        
+        # Both visible - check which is moving more
+        left_moving = angles.left_elbow < self.MAX_ELBOW_ANGLE - 15
+        right_moving = angles.right_elbow < self.MAX_ELBOW_ANGLE - 15
+        
+        if left_moving and right_moving:
+            return "both"
+        elif left_moving:
+            return "left"
+        elif right_moving:
+            return "right"
+        
+        # Neither clearly moving yet - check which has more curl
+        left_curl_amount = self.MAX_ELBOW_ANGLE - angles.left_elbow
+        right_curl_amount = self.MAX_ELBOW_ANGLE - angles.right_elbow
+        
+        if abs(left_curl_amount - right_curl_amount) < 10:
+            return "both"
+        return "left" if left_curl_amount > right_curl_amount else "right"
+    
+    def _check_elbow_drift(self, landmarks: dict[JointName, Landmark]) -> tuple[bool, bool]:
+        """
+        Check if elbows are drifting away from the body.
+        Returns (left_drift, right_drift).
+        """
+        left_drift = False
+        right_drift = False
+        
+        # Only check if arm is visible
+        if self._check_arm_visibility(landmarks, "left"):
+            left_elbow_x = landmarks[JointName.LEFT_ELBOW].x
+            left_shoulder_x = landmarks[JointName.LEFT_SHOULDER].x
+            left_drift = abs(left_elbow_x - left_shoulder_x) > self.ELBOW_DRIFT_THRESHOLD
+        
+        if self._check_arm_visibility(landmarks, "right"):
+            right_elbow_x = landmarks[JointName.RIGHT_ELBOW].x
+            right_shoulder_x = landmarks[JointName.RIGHT_SHOULDER].x
+            right_drift = abs(right_elbow_x - right_shoulder_x) > self.ELBOW_DRIFT_THRESHOLD
+        
+        return left_drift, right_drift
+    
+    def _check_body_swing(self, landmarks: dict[JointName, Landmark]) -> bool:
+        """Check if body is swinging to generate momentum."""
+        mid_shoulder_x = (landmarks[JointName.LEFT_SHOULDER].x + 
+                         landmarks[JointName.RIGHT_SHOULDER].x) / 2
+        mid_shoulder_y = (landmarks[JointName.LEFT_SHOULDER].y + 
+                         landmarks[JointName.RIGHT_SHOULDER].y) / 2
+        
+        # Initialize reference position
+        if self._initial_shoulder_x is None:
+            self._initial_shoulder_x = mid_shoulder_x
+            self._initial_shoulder_y = mid_shoulder_y
+            return False
+        
+        # Check for excessive movement
+        x_movement = abs(mid_shoulder_x - self._initial_shoulder_x)
+        y_movement = abs(mid_shoulder_y - self._initial_shoulder_y)
+        
+        return x_movement > self.BODY_SWING_THRESHOLD or y_movement > self.BODY_SWING_THRESHOLD
+    
+    def _check_full_rom(self, angles: JointAngles) -> tuple[bool, bool]:
+        """
+        Check if full range of motion is being achieved.
+        Returns (full_extension, full_contraction).
+        """
+        # Use the active arm's angle
+        if self._active_arm == "left":
+            elbow_angle = angles.left_elbow
+        elif self._active_arm == "right":
+            elbow_angle = angles.right_elbow
+        else:
+            elbow_angle = (angles.left_elbow + angles.right_elbow) / 2
+        
+        # Track min/max through the rep
+        self._lowest_elbow_angle = min(self._lowest_elbow_angle, elbow_angle)
+        self._highest_elbow_angle = max(self._highest_elbow_angle, elbow_angle)
+        
+        full_extension = self._highest_elbow_angle > self.MAX_ELBOW_ANGLE - 20
+        full_contraction = self._lowest_elbow_angle < self.MIN_ELBOW_ANGLE + 20
+        
+        return full_extension, full_contraction
+    
+    def detect_rep_phase(self, landmarks: dict[JointName, Landmark]) -> str:
+        """Detect current phase of bicep curl repetition with hysteresis."""
+        angles = self._calculate_angles(landmarks)
+        
+        # Detect which arm is active
+        self._active_arm = self._detect_active_arm(landmarks)
+        
+        # Use active arm's angle
+        if self._active_arm == "left":
+            elbow_angle = angles.left_elbow
+        elif self._active_arm == "right":
+            elbow_angle = angles.right_elbow
+        else:
+            elbow_angle = min(angles.left_elbow, angles.right_elbow)  # Use most curled
+        
+        # Apply hysteresis for state transitions
+        if self._in_curl:
+            # Currently in curl - need to extend past threshold + hysteresis to exit
+            extension_threshold = self.MAX_ELBOW_ANGLE - self.ANGLE_HYSTERESIS
+            contraction_threshold = self.MIN_ELBOW_ANGLE + self.ANGLE_HYSTERESIS
+        else:
+            # Currently extended - need to curl past threshold - hysteresis to enter
+            extension_threshold = self.MAX_ELBOW_ANGLE
+            contraction_threshold = self.MIN_ELBOW_ANGLE + (self.ANGLE_HYSTERESIS * 2)
+        
+        if elbow_angle > extension_threshold:
+            # Arms extended (bottom position)
+            if self._in_curl:
+                # Confirm with multiple frames
+                self._extend_confirm_count += 1
+                if self._extend_confirm_count >= self.MIN_FRAMES_TO_CONFIRM:
+                    self._in_curl = False
+                    self._extend_confirm_count = 0
+                    self._curl_confirm_count = 0
+                    # Reset tracking for next rep
+                    self._lowest_elbow_angle = 180.0
+                    self._highest_elbow_angle = 0.0
+                    return "down"
+                return "down"  # Transitioning down
+            return "idle"
+        elif elbow_angle < contraction_threshold:
+            # Top of curl (contracted)
+            self._curl_confirm_count += 1
+            if self._curl_confirm_count >= self.MIN_FRAMES_TO_CONFIRM:
+                self._in_curl = True
+                self._curl_confirm_count = 0
+                self._extend_confirm_count = 0
+            return "hold"
+        else:
+            # Transitioning - reset confirm counters
+            self._curl_confirm_count = 0
+            self._extend_confirm_count = 0
+            
+            if self._in_curl:
+                if elbow_angle > self._lowest_elbow_angle + 15:
+                    return "down"
+                return "up"
+            else:
+                self._in_curl = True
+                return "up"
+    
+    def check_form(self, landmarks: dict[JointName, Landmark]) -> ExerciseResult:
+        """Analyze bicep curl form and return corrections."""
+        violations = []
+        corrections = []
+        joint_colors = {}
+        
+        # Calculate angles
+        angles = self._calculate_angles(landmarks)
+        
+        # Initialize all tracked joints as green
+        for joint in self.required_joints:
+            joint_colors[joint.value] = "green"
+        
+        is_valid = True
+        
+        # Check visibility - provide feedback if arms not visible
+        left_visible = self._check_arm_visibility(landmarks, "left")
+        right_visible = self._check_arm_visibility(landmarks, "right")
+        
+        if not left_visible and not right_visible:
+            return ExerciseResult(
+                is_valid=False,
+                rep_count=self.rep_count,
+                rep_phase=self.current_phase,
+                violations=["Arms not visible"],
+                corrections=["Adjust camera to see your arms clearly"],
+                joint_colors=joint_colors,
+                confidence=0.3,
+                angles=angles
+            )
+        
+        # Check elbow drift (only for visible arms)
+        left_drift, right_drift = self._check_elbow_drift(landmarks)
+        
+        if left_drift and self._active_arm in ["left", "both"] and left_visible:
+            violations.append("Left elbow drifting forward")
+            corrections.append("Keep your left elbow pinned to your side")
+            joint_colors[JointName.LEFT_ELBOW.value] = "red"
+            is_valid = False
+        
+        if right_drift and self._active_arm in ["right", "both"] and right_visible:
+            violations.append("Right elbow drifting forward")
+            corrections.append("Keep your right elbow pinned to your side")
+            joint_colors[JointName.RIGHT_ELBOW.value] = "red"
+            is_valid = False
+        
+        # Check body swing
+        if self._check_body_swing(landmarks):
+            violations.append("Body swinging for momentum")
+            corrections.append("Keep your torso still - use only your biceps")
+            joint_colors[JointName.LEFT_SHOULDER.value] = "yellow"
+            joint_colors[JointName.RIGHT_SHOULDER.value] = "yellow"
+            # Update reference position
+            self._initial_shoulder_x = None
+        
+        # Check range of motion - only warn if clearly incomplete
+        full_extension, full_contraction = self._check_full_rom(angles)
+        
+        # Only check ROM if we're in an active curl (reduce false positives)
+        if self._in_curl and self.current_phase == "hold" and not full_contraction:
+            # Be lenient - only flag if significantly incomplete
+            active_angle = angles.left_elbow if self._active_arm == "left" else angles.right_elbow
+            if self._active_arm == "both":
+                active_angle = min(angles.left_elbow, angles.right_elbow)
+            
+            if active_angle > self.MIN_ELBOW_ANGLE + 30:  # More than 30 degrees off
+                violations.append("Incomplete curl at top")
+                corrections.append("Squeeze your biceps fully at the top")
+                joint_colors[JointName.LEFT_WRIST.value] = "yellow"
+                joint_colors[JointName.RIGHT_WRIST.value] = "yellow"
+        
+        # Check symmetry for alternating or simultaneous curls (more lenient)
+        if self._active_arm == "both" and left_visible and right_visible:
+            elbow_asymmetry = abs(angles.left_elbow - angles.right_elbow)
+            if elbow_asymmetry > 35:  # Was 25 - more forgiving
+                violations.append("Uneven arm movement")
+                corrections.append("Curl both arms at the same pace")
+                if angles.left_elbow > angles.right_elbow:
+                    joint_colors[JointName.LEFT_ELBOW.value] = "yellow"
+                else:
+                    joint_colors[JointName.RIGHT_ELBOW.value] = "yellow"
+        
+        # Calculate confidence based on joint visibility
+        visibility_sum = sum(landmarks[j].visibility for j in self.required_joints)
+        confidence = visibility_sum / len(self.required_joints)
+        
+        return ExerciseResult(
+            is_valid=is_valid,
+            rep_count=self.rep_count,
+            rep_phase=self.current_phase,
+            violations=violations,
+            corrections=corrections,
+            joint_colors=joint_colors,
+            confidence=confidence,
+            angles=angles
+        )
+    
+    def _is_rep_complete(self, last_phase: str, current_phase: str) -> bool:
+        """Rep complete when returning to bottom from top."""
+        return last_phase == "down" and current_phase == "idle"
+    
+    def reset(self) -> None:
+        """Reset all tracking state."""
+        super().reset()
+        self._lowest_elbow_angle = 180.0
+        self._highest_elbow_angle = 0.0
+        self._in_curl = False
+        self._initial_shoulder_x = None
+        self._initial_shoulder_y = None
+        self._active_arm = None
+        self._left_elbow_buffer.clear()
+        self._right_elbow_buffer.clear()
+        self._curl_confirm_count = 0
+        self._extend_confirm_count = 0
+        self._pending_state_change = None
