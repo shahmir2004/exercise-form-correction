@@ -17,6 +17,7 @@ class ExerciseType(str, Enum):
     SQUAT = "squat"
     PUSHUP = "pushup"
     BICEP_CURL = "bicep_curl"
+    ALTERNATE_BICEP_CURL = "alternate_bicep_curl"
 
 
 @dataclass
@@ -264,6 +265,7 @@ class ExerciseClassifier:
         scores = {
             ExerciseType.PUSHUP: ClassificationScore(),
             ExerciseType.BICEP_CURL: ClassificationScore(),
+            ExerciseType.ALTERNATE_BICEP_CURL: ClassificationScore(),
             ExerciseType.SQUAT: ClassificationScore(),
         }
         
@@ -359,6 +361,38 @@ class ExerciseClassifier:
         if is_horizontal:
             squat_score.score *= 0.1
         
+        # ============ ALTERNATE BICEP CURL SCORING ============
+        # Key difference from regular curl: arms move one at a time
+        alt_curl_score = scores[ExerciseType.ALTERNATE_BICEP_CURL]
+        
+        # Check for alternating pattern: one arm moves while other stays stable
+        left_wrist_y_disp = self.motion_buffer.get_displacement("left_wrist_y")
+        right_wrist_y_disp = self.motion_buffer.get_displacement("right_wrist_y")
+        
+        # Arms should both have significant movement (just not simultaneously)
+        both_arms_active = left_elbow_disp > 25 and right_elbow_disp > 25
+        
+        # Check for asymmetric movement (one arm much more active at a time)
+        elbow_diff = abs(left_elbow_disp - right_elbow_disp)
+        wrist_diff = abs(left_wrist_y_disp - right_wrist_y_disp)
+        
+        # Alternate curls show asymmetric instantaneous movement
+        asymmetric_movement = elbow_diff > 15 or wrist_diff > 0.03
+        
+        if both_arms_active and asymmetric_movement:
+            # This looks like alternate curls
+            alt_curl_score.add_factor("both_arms_active", 1.0, 2.0)
+            alt_curl_score.add_factor("asymmetric_pattern", min(1.0, elbow_diff / 30), 2.5)
+            alt_curl_score.add_factor("hip_stable", hip_stable, 1.5)
+            alt_curl_score.add_factor("shoulder_stable", shoulder_stable, 1.0)
+        else:
+            # Doesn't look like alternate curls
+            alt_curl_score.add_factor("both_arms_active", 0.0, 2.0)
+        
+        # Penalty if horizontal
+        if is_horizontal:
+            alt_curl_score.score *= 0.2
+        
         return scores
     
     def identify_exercise(self) -> MotionAnalysis:
@@ -419,6 +453,12 @@ class ExerciseClassifier:
         if best_exercise == ExerciseType.PUSHUP:
             has_full_rep = self.motion_buffer.has_completed_rep("left_elbow", 70, 160)
         elif best_exercise == ExerciseType.BICEP_CURL:
+            has_full_rep = (
+                self.motion_buffer.has_completed_rep("left_elbow", 40, 150) or
+                self.motion_buffer.has_completed_rep("right_elbow", 40, 150)
+            )
+        elif best_exercise == ExerciseType.ALTERNATE_BICEP_CURL:
+            # For alternate curls, check either arm
             has_full_rep = (
                 self.motion_buffer.has_completed_rep("left_elbow", 40, 150) or
                 self.motion_buffer.has_completed_rep("right_elbow", 40, 150)

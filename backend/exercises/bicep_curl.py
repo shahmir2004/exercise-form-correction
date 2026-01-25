@@ -515,3 +515,257 @@ class BicepCurlModule(BaseExercise):
         self._extend_confirm_count = 0
         self._pending_state_change = None
         self._seated_frame_count = 0
+
+
+class AlternateBicepCurlModule(BicepCurlModule):
+    """Alternate bicep curl - alternating between left and right arms.
+    
+    Each arm performs a complete rep before switching to the other arm.
+    Counts each arm's rep separately but displays total reps.
+    
+    Supports:
+    - Standing alternate curls
+    - Seated alternate curls
+    - Tracking left/right arm balance
+    """
+    
+    def __init__(self):
+        super().__init__()
+        
+        # Alternate curl specific state
+        self._current_arm: str = "left"  # Which arm should curl next
+        self._left_rep_count: int = 0
+        self._right_rep_count: int = 0
+        self._last_curling_arm: Optional[str] = None
+        
+        # Per-arm state tracking
+        self._left_in_curl: bool = False
+        self._right_in_curl: bool = False
+        self._left_lowest_angle: float = 180.0
+        self._right_lowest_angle: float = 180.0
+        
+        # Arm switch detection
+        self._arm_switch_pending: bool = False
+        self._frames_since_last_rep: int = 0
+        self._max_frames_between_switch: int = 60  # ~2 seconds at 30fps
+        
+        # Create separate rep counters for each arm
+        from utils.rep_counter import HysteresisRepCounter
+        self._left_rep_counter = HysteresisRepCounter(
+            upper_threshold=self.MAX_ELBOW_ANGLE - 10,
+            lower_threshold=self.MIN_ELBOW_ANGLE + 20,
+            min_rep_duration=0.5,
+            max_rep_duration=8.0
+        )
+        self._right_rep_counter = HysteresisRepCounter(
+            upper_threshold=self.MAX_ELBOW_ANGLE - 10,
+            lower_threshold=self.MIN_ELBOW_ANGLE + 20,
+            min_rep_duration=0.5,
+            max_rep_duration=8.0
+        )
+    
+    @property
+    def name(self) -> str:
+        return "Alternate Bicep Curl"
+    
+    @property
+    def current_arm(self) -> str:
+        """Get the arm that is currently curling or should curl next."""
+        return self._current_arm
+    
+    @property
+    def left_reps(self) -> int:
+        """Get left arm rep count."""
+        return self._left_rep_count
+    
+    @property
+    def right_reps(self) -> int:
+        """Get right arm rep count."""
+        return self._right_rep_count
+    
+    @property
+    def arm_balance(self) -> float:
+        """Get arm balance ratio (1.0 = perfectly balanced)."""
+        total = self._left_rep_count + self._right_rep_count
+        if total == 0:
+            return 1.0
+        min_reps = min(self._left_rep_count, self._right_rep_count)
+        max_reps = max(self._left_rep_count, self._right_rep_count)
+        return min_reps / max_reps if max_reps > 0 else 1.0
+    
+    def _detect_curling_arm(self, landmarks: dict[JointName, Landmark]) -> Optional[str]:
+        """Detect which arm is currently performing a curl.
+        
+        For alternate curls, only one arm should be curling at a time.
+        Returns 'left', 'right', or None if neither is clearly curling.
+        """
+        angles = self._last_angles or self._calculate_angles(landmarks)
+        
+        left_visible = self._check_arm_visibility(landmarks, "left")
+        right_visible = self._check_arm_visibility(landmarks, "right")
+        
+        # Check which arm is in a curled position
+        left_curling = (left_visible and 
+                       angles.left_elbow < self.MAX_ELBOW_ANGLE - 20 and
+                       angles.left_elbow < angles.right_elbow - 15)
+        
+        right_curling = (right_visible and 
+                        angles.right_elbow < self.MAX_ELBOW_ANGLE - 20 and
+                        angles.right_elbow < angles.left_elbow - 15)
+        
+        if left_curling and not right_curling:
+            return "left"
+        elif right_curling and not left_curling:
+            return "right"
+        elif left_curling and right_curling:
+            # Both curling - this shouldn't happen in alternate curls
+            # Return the one that's more curled
+            return "left" if angles.left_elbow < angles.right_elbow else "right"
+        
+        return None
+    
+    def detect_rep_phase(self, landmarks: dict[JointName, Landmark]) -> str:
+        """Detect current phase for alternate bicep curls.
+        
+        Tracks each arm independently and switches focus when one arm completes.
+        """
+        angles = self._calculate_angles(landmarks)
+        self._frames_since_last_rep += 1
+        
+        # Detect which arm is actively curling
+        curling_arm = self._detect_curling_arm(landmarks)
+        
+        # Update both arm states
+        left_phase, left_completed = self._left_rep_counter.update(
+            angles.left_elbow,
+            left_angle=angles.left_elbow
+        )
+        right_phase, right_completed = self._right_rep_counter.update(
+            angles.right_elbow,
+            right_angle=angles.right_elbow
+        )
+        
+        # Track lowest angles for each arm
+        self._left_lowest_angle = min(self._left_lowest_angle, angles.left_elbow)
+        self._right_lowest_angle = min(self._right_lowest_angle, angles.right_elbow)
+        
+        # Handle rep completion for each arm
+        if left_completed:
+            self._left_rep_count += 1
+            self.rep_count = self._left_rep_count + self._right_rep_count
+            self._last_curling_arm = "left"
+            self._current_arm = "right"  # Switch to other arm
+            self._frames_since_last_rep = 0
+            self._left_lowest_angle = 180.0
+            self._left_in_curl = False
+        
+        if right_completed:
+            self._right_rep_count += 1
+            self.rep_count = self._left_rep_count + self._right_rep_count
+            self._last_curling_arm = "right"
+            self._current_arm = "left"  # Switch to other arm
+            self._frames_since_last_rep = 0
+            self._right_lowest_angle = 180.0
+            self._right_in_curl = False
+        
+        # Update curl state based on current position
+        self._left_in_curl = angles.left_elbow < self.MAX_ELBOW_ANGLE - 20
+        self._right_in_curl = angles.right_elbow < self.MAX_ELBOW_ANGLE - 20
+        
+        # Determine overall phase based on which arm is active
+        if curling_arm == "left":
+            return left_phase.value if hasattr(left_phase, 'value') else str(left_phase)
+        elif curling_arm == "right":
+            return right_phase.value if hasattr(right_phase, 'value') else str(right_phase)
+        else:
+            # Neither curling - use the expected arm's phase
+            if self._current_arm == "left":
+                return left_phase.value if hasattr(left_phase, 'value') else str(left_phase)
+            else:
+                return right_phase.value if hasattr(right_phase, 'value') else str(right_phase)
+    
+    def check_form(self, landmarks: dict[JointName, Landmark]) -> ExerciseResult:
+        """Analyze alternate bicep curl form.
+        
+        Additional checks for alternate curls:
+        - One arm should stay extended while other curls
+        - Arms should alternate (not both curl together)
+        - Balance between left and right reps
+        """
+        # Get base form check
+        result = super().check_form(landmarks)
+        
+        angles = self._last_angles or self._calculate_angles(landmarks)
+        
+        # Check for proper alternation (one arm extended, one curling)
+        left_extended = angles.left_elbow > self.MAX_ELBOW_ANGLE - 25
+        right_extended = angles.right_elbow > self.MAX_ELBOW_ANGLE - 25
+        left_curled = angles.left_elbow < self.MIN_ELBOW_ANGLE + 30
+        right_curled = angles.right_elbow < self.MIN_ELBOW_ANGLE + 30
+        
+        # Warn if both arms are curling at the same time
+        if left_curled and right_curled:
+            result.violations.append("Both arms curling together")
+            result.corrections.append("Keep one arm extended while curling the other")
+            result.joint_colors[JointName.LEFT_ELBOW.value] = "yellow"
+            result.joint_colors[JointName.RIGHT_ELBOW.value] = "yellow"
+        
+        # Check arm balance (after a few reps)
+        total_reps = self._left_rep_count + self._right_rep_count
+        if total_reps >= 4:
+            balance = self.arm_balance
+            if balance < 0.7:
+                weaker_arm = "left" if self._left_rep_count < self._right_rep_count else "right"
+                result.violations.append(f"Arm imbalance detected")
+                result.corrections.append(f"Focus on {weaker_arm} arm - it has fewer reps")
+        
+        # Check that non-curling arm stays extended
+        curling_arm = self._detect_curling_arm(landmarks)
+        if curling_arm == "left" and not right_extended:
+            if angles.right_elbow < self.MAX_ELBOW_ANGLE - 35:
+                result.violations.append("Right arm not staying extended")
+                result.corrections.append("Keep right arm straight while curling left")
+                result.joint_colors[JointName.RIGHT_ELBOW.value] = "yellow"
+        elif curling_arm == "right" and not left_extended:
+            if angles.left_elbow < self.MAX_ELBOW_ANGLE - 35:
+                result.violations.append("Left arm not staying extended")
+                result.corrections.append("Keep left arm straight while curling right")
+                result.joint_colors[JointName.LEFT_ELBOW.value] = "yellow"
+        
+        return result
+    
+    def get_arm_stats(self) -> dict:
+        """Get detailed statistics for each arm."""
+        return {
+            "left": {
+                "rep_count": self._left_rep_count,
+                "quality": self._left_rep_counter.average_quality,
+                "partial_reps": self._left_rep_counter.partial_reps,
+                "in_curl": self._left_in_curl,
+            },
+            "right": {
+                "rep_count": self._right_rep_count,
+                "quality": self._right_rep_counter.average_quality,
+                "partial_reps": self._right_rep_counter.partial_reps,
+                "in_curl": self._right_in_curl,
+            },
+            "balance": self.arm_balance,
+            "total_reps": self.rep_count,
+            "current_arm": self._current_arm,
+        }
+    
+    def reset(self) -> None:
+        """Reset all tracking state for alternate curls."""
+        super().reset()
+        self._current_arm = "left"
+        self._left_rep_count = 0
+        self._right_rep_count = 0
+        self._last_curling_arm = None
+        self._left_in_curl = False
+        self._right_in_curl = False
+        self._left_lowest_angle = 180.0
+        self._right_lowest_angle = 180.0
+        self._arm_switch_pending = False
+        self._frames_since_last_rep = 0
+        self._left_rep_counter.reset()
+        self._right_rep_counter.reset()
