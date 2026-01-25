@@ -63,6 +63,12 @@ class BicepCurlModule(BaseExercise):
         
         # Seated detection buffer
         self._seated_frame_count = 0
+        
+        # Create hysteresis-based rep counter for stable counting
+        self._create_rep_counter(
+            upper_threshold=self.MAX_ELBOW_ANGLE - 10,  # ~135 degrees
+            lower_threshold=self.MIN_ELBOW_ANGLE + 20    # ~70 degrees
+        )
     
     @property
     def name(self) -> str:
@@ -294,7 +300,7 @@ class BicepCurlModule(BaseExercise):
         return full_extension, full_contraction
     
     def detect_rep_phase(self, landmarks: dict[JointName, Landmark]) -> str:
-        """Detect current phase of bicep curl repetition with hysteresis."""
+        """Detect current phase of bicep curl repetition with hysteresis rep counter."""
         angles = self._calculate_angles(landmarks)
         
         # Detect which arm is active
@@ -303,11 +309,41 @@ class BicepCurlModule(BaseExercise):
         # Use active arm's angle
         if self._active_arm == "left":
             elbow_angle = angles.left_elbow
+            left_angle = angles.left_elbow
+            right_angle = None
         elif self._active_arm == "right":
             elbow_angle = angles.right_elbow
+            left_angle = None
+            right_angle = angles.right_elbow
         else:
             elbow_angle = min(angles.left_elbow, angles.right_elbow)  # Use most curled
+            left_angle = angles.left_elbow
+            right_angle = angles.right_elbow
         
+        # Use hysteresis-based rep counter for stable phase detection
+        if self._rep_counter:
+            phase_str, rep_completed = self.update_rep_counter(
+                angle=elbow_angle,
+                left_angle=left_angle,
+                right_angle=right_angle
+            )
+            
+            # Track min/max for ROM validation
+            self._lowest_elbow_angle = min(self._lowest_elbow_angle, elbow_angle)
+            self._highest_elbow_angle = max(self._highest_elbow_angle, elbow_angle)
+            
+            # Update internal state to match counter
+            if phase_str in ["up", "down", "hold"]:
+                self._in_curl = phase_str in ["up", "hold"]
+            
+            if rep_completed:
+                # Reset tracking for next rep
+                self._lowest_elbow_angle = 180.0
+                self._highest_elbow_angle = 0.0
+            
+            return phase_str
+        
+        # Fallback to legacy detection if counter not available
         # Apply hysteresis for state transitions
         if self._in_curl:
             # Currently in curl - need to extend past threshold + hysteresis to exit

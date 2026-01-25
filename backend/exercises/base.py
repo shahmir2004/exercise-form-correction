@@ -6,6 +6,8 @@ from enum import Enum
 from typing import Optional
 import numpy as np
 
+from utils.rep_counter import HysteresisRepCounter, RepPhase, RepQuality
+
 
 class JointName(str, Enum):
     """MediaPipe pose landmark names."""
@@ -116,6 +118,8 @@ class ExerciseResult:
     joint_colors: dict[str, str] = field(default_factory=dict)  # joint_name -> "green" | "red" | "yellow"
     confidence: float = 0.0
     angles: Optional[JointAngles] = None
+    rep_quality: Optional[float] = None  # 0-1 quality score for last rep
+    partial_reps: int = 0  # Count of incomplete reps
 
 
 def calculate_angle(p1: Landmark, p2: Landmark, p3: Landmark) -> float:
@@ -166,6 +170,62 @@ class BaseExercise(ABC):
         self.current_phase = "idle"
         self._phase_history: list[str] = []
         self._last_angles: Optional[JointAngles] = None
+        self._rep_counter: Optional[HysteresisRepCounter] = None
+    
+    def _create_rep_counter(self, upper_threshold: float, lower_threshold: float) -> HysteresisRepCounter:
+        """
+        Create a hysteresis-based rep counter.
+        
+        Args:
+            upper_threshold: Angle at extended/starting position
+            lower_threshold: Angle at contracted/bottom position
+        """
+        self._rep_counter = HysteresisRepCounter(
+            upper_threshold=upper_threshold,
+            lower_threshold=lower_threshold,
+            min_rep_duration=0.5,
+            max_rep_duration=10.0
+        )
+        return self._rep_counter
+    
+    def update_rep_counter(
+        self, 
+        angle: float, 
+        left_angle: Optional[float] = None,
+        right_angle: Optional[float] = None,
+        form_violations: Optional[list[str]] = None
+    ) -> tuple[str, bool]:
+        """
+        Update rep counter with current angle.
+        
+        Returns:
+            Tuple of (phase_string, rep_just_completed)
+        """
+        if not self._rep_counter:
+            return "idle", False
+        
+        phase, rep_completed = self._rep_counter.update(
+            angle, left_angle, right_angle, form_violations
+        )
+        
+        if rep_completed:
+            self.rep_count = self._rep_counter.rep_count
+        
+        return phase.value, rep_completed
+    
+    @property
+    def rep_quality(self) -> Optional[float]:
+        """Get average rep quality score."""
+        if self._rep_counter:
+            return self._rep_counter.average_quality
+        return None
+    
+    @property
+    def partial_reps(self) -> int:
+        """Get count of partial/invalid reps."""
+        if self._rep_counter:
+            return self._rep_counter.partial_reps
+        return 0
     
     @property
     @abstractmethod
@@ -252,6 +312,8 @@ class BaseExercise(ABC):
         result = self.check_form(landmark_dict)
         result.rep_count = self.rep_count
         result.rep_phase = current_phase
+        result.rep_quality = self.rep_quality
+        result.partial_reps = self.partial_reps
         
         return result
     
@@ -266,3 +328,5 @@ class BaseExercise(ABC):
         self.current_phase = "idle"
         self._phase_history = []
         self._last_angles = None
+        if self._rep_counter:
+            self._rep_counter.reset()

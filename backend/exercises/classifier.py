@@ -8,6 +8,7 @@ import numpy as np
 
 from config.settings import settings
 from .base import JointName, Landmark, landmarks_to_dict, calculate_angle
+from utils.smoothing import LandmarkSmoother, MultiAngleSmoother, SmoothingConfig
 
 
 class ExerciseType(str, Enum):
@@ -29,6 +30,19 @@ class MotionAnalysis:
     shoulder_displacement: float = 0.0
     is_horizontal: bool = False
     has_full_rep: bool = False
+    classification_scores: dict = field(default_factory=dict)  # Detailed scoring
+
+
+@dataclass
+class ClassificationScore:
+    """Weighted score for exercise classification."""
+    score: float = 0.0
+    factors: dict = field(default_factory=dict)
+    
+    def add_factor(self, name: str, value: float, weight: float = 1.0):
+        """Add a scoring factor."""
+        self.factors[name] = {"value": value, "weight": weight, "contribution": value * weight}
+        self.score += value * weight
 
 
 @dataclass
@@ -199,32 +213,61 @@ class MotionBuffer:
 
 
 class ExerciseClassifier:
-    """Classifies exercises based on motion buffer analysis."""
+    """
+    Classifies exercises based on motion buffer analysis.
+    
+    Features:
+    - Landmark smoothing for noise reduction
+    - Multi-factor weighted classification
+    - Confidence scoring with history
+    - Exercise lock-in with switch detection
+    """
     
     def __init__(self):
         self.motion_buffer = MotionBuffer()
         self._locked_exercise: Optional[ExerciseType] = None
         self._confidence_history: deque[float] = deque(maxlen=30)
         self._exercise_history: deque[ExerciseType] = deque(maxlen=30)
+        
+        # Smoothing for pose accuracy
+        self._landmark_smoother = LandmarkSmoother(
+            config=SmoothingConfig(alpha=0.4, velocity_threshold=0.25)
+        )
+        self._angle_smoother = MultiAngleSmoother(alpha=0.35, dead_zone=2.0)
+        
+        # Classification weights
+        self._weights = {
+            "pushup": {"horizontal": 3.0, "elbow_disp": 2.0, "wrist_stable": 1.0},
+            "bicep_curl": {"elbow_disp": 2.5, "wrist_y_move": 2.0, "hip_stable": 1.5, "shoulder_stable": 1.0},
+            "squat": {"knee_disp": 2.5, "hip_disp": 2.0, "hip_y_move": 1.5, "upper_stable": 1.0}
+        }
     
-    def add_frame(self, landmarks: list[dict]) -> None:
-        """Add a frame to the motion buffer."""
-        self.motion_buffer.add_frame(landmarks)
-    
-    def identify_exercise(self) -> MotionAnalysis:
+    def add_frame(self, landmarks: list[dict]) -> list[dict]:
         """
-        Analyze the motion buffer to identify the exercise.
+        Add a frame to the motion buffer with smoothing.
         
         Returns:
-            MotionAnalysis with exercise type and confidence
+            Smoothed landmarks
         """
-        if self.motion_buffer.size < 15:
-            return MotionAnalysis(
-                exercise_type=ExerciseType.UNKNOWN,
-                confidence=0.0
-            )
+        # Apply landmark smoothing for pose accuracy
+        smoothed_landmarks = self._landmark_smoother.smooth(landmarks)
+        self.motion_buffer.add_frame(smoothed_landmarks)
+        return smoothed_landmarks
+    
+    def _calculate_exercise_scores(self) -> dict[ExerciseType, ClassificationScore]:
+        """
+        Calculate weighted classification scores for each exercise.
         
-        # Calculate displacements for key joints (angle changes)
+        Returns:
+            Dict mapping exercise type to its score
+        """
+        scores = {
+            ExerciseType.PUSHUP: ClassificationScore(),
+            ExerciseType.BICEP_CURL: ClassificationScore(),
+            ExerciseType.SQUAT: ClassificationScore(),
+        }
+        
+        # Get raw displacements
         left_elbow_disp = self.motion_buffer.get_displacement("left_elbow")
         right_elbow_disp = self.motion_buffer.get_displacement("right_elbow")
         elbow_displacement = max(left_elbow_disp, right_elbow_disp)
@@ -237,7 +280,7 @@ class ExerciseClassifier:
         right_hip_disp = self.motion_buffer.get_displacement("right_hip")
         hip_displacement = max(left_hip_disp, right_hip_disp)
         
-        # Calculate positional displacements (y-axis movement)
+        # Positional displacements
         wrist_y_disp = max(
             self.motion_buffer.get_displacement("left_wrist_y"),
             self.motion_buffer.get_displacement("right_wrist_y")
@@ -253,84 +296,160 @@ class ExerciseClassifier:
         
         is_horizontal = self.motion_buffer.is_horizontal()
         
-        # Classification logic - IMPROVED with multi-factor analysis
-        exercise_type = ExerciseType.UNKNOWN
-        confidence = 0.0
-        has_full_rep = False
+        # ============ PUSH-UP SCORING ============
+        pushup_score = scores[ExerciseType.PUSHUP]
+        w = self._weights["pushup"]
         
-        # ============ PUSH-UP ============
-        # Body horizontal + significant elbow angle change
-        if is_horizontal and elbow_displacement > 30:
-            exercise_type = ExerciseType.PUSHUP
-            confidence = min(0.95, 0.5 + elbow_displacement / 100)
-            has_full_rep = self.motion_buffer.has_completed_rep("left_elbow", 70, 160)
+        # Horizontal body position (critical for pushup)
+        pushup_score.add_factor("horizontal", 1.0 if is_horizontal else 0.0, w["horizontal"])
         
-        # ============ BICEP CURL ============
-        # Key indicators:
-        # 1. Elbow angle changes significantly (arm bending)
-        # 2. Wrist moves vertically (hand going up/down)
-        # 3. Hips stay relatively stable (not squatting)
-        # 4. Shoulders stay stable (not doing overhead press)
-        elif (elbow_displacement > 35 and 
-              wrist_y_disp > 0.05 and  # Wrist moves vertically
-              hip_y_disp < 0.08 and    # Hips stay stable (not squatting)
-              shoulder_y_disp < 0.06 and  # Shoulders stable (not jumping)
-              knee_displacement < elbow_displacement * 0.8):  # Elbows move more than knees
-            exercise_type = ExerciseType.BICEP_CURL
-            # Higher confidence if elbow displacement is much greater than knee
-            elbow_knee_ratio = elbow_displacement / max(knee_displacement, 1)
-            confidence = min(0.95, 0.4 + elbow_displacement / 100 + min(elbow_knee_ratio * 0.1, 0.3))
-            has_full_rep = self.motion_buffer.has_completed_rep("left_elbow", 40, 150) or \
-                           self.motion_buffer.has_completed_rep("right_elbow", 40, 150)
+        # Elbow angle change
+        elbow_factor = min(1.0, elbow_displacement / 60) if is_horizontal else 0.0
+        pushup_score.add_factor("elbow_displacement", elbow_factor, w["elbow_disp"])
         
-        # ============ SQUAT ============
-        # Key indicators:
-        # 1. Knee angle changes significantly
-        # 2. Hip moves down (y increases in normalized coords)
-        # 3. Hip angle changes (bending at hips)
-        # 4. Upper body stays relatively stable (wrists not moving much)
-        elif (knee_displacement > 30 and 
-              hip_displacement > 15 and  # Hip angle must change for squat
-              hip_y_disp > 0.03 and      # Hips move vertically
-              (wrist_y_disp < 0.1 or knee_displacement > elbow_displacement * 1.5)):  # Not curling
-            exercise_type = ExerciseType.SQUAT
-            confidence = min(0.95, 0.4 + knee_displacement / 100 + hip_displacement / 100)
-            has_full_rep = self.motion_buffer.has_completed_rep("left_knee", 70, 160) or \
-                           self.motion_buffer.has_completed_rep("right_knee", 70, 160)
+        # Wrists should be stable (not moving up/down like curls)
+        wrist_stable = 1.0 - min(1.0, wrist_y_disp / 0.15)
+        pushup_score.add_factor("wrist_stable", wrist_stable if is_horizontal else 0.0, w["wrist_stable"])
         
-        # ============ FALLBACK DETECTION ============
-        # If still unknown but there's clear movement, try ratio-based detection
-        elif elbow_displacement > 40 or knee_displacement > 40:
-            # Compare upper body vs lower body movement
-            upper_body_score = elbow_displacement + wrist_y_disp * 100
-            lower_body_score = knee_displacement + hip_displacement + hip_y_disp * 100
+        # ============ BICEP CURL SCORING ============
+        curl_score = scores[ExerciseType.BICEP_CURL]
+        w = self._weights["bicep_curl"]
+        
+        # Elbow angle change (primary indicator)
+        elbow_factor = min(1.0, elbow_displacement / 70)
+        curl_score.add_factor("elbow_displacement", elbow_factor, w["elbow_disp"])
+        
+        # Wrist vertical movement
+        wrist_move = min(1.0, wrist_y_disp / 0.15)
+        curl_score.add_factor("wrist_y_movement", wrist_move, w["wrist_y_move"])
+        
+        # Hips should be stable (not squatting)
+        hip_stable = 1.0 - min(1.0, hip_y_disp / 0.10)
+        curl_score.add_factor("hip_stable", hip_stable, w["hip_stable"])
+        
+        # Shoulders should be stable (not pressing overhead)
+        shoulder_stable = 1.0 - min(1.0, shoulder_y_disp / 0.08)
+        curl_score.add_factor("shoulder_stable", shoulder_stable, w["shoulder_stable"])
+        
+        # Penalty if horizontal (push-up position)
+        if is_horizontal:
+            curl_score.score *= 0.2
+        
+        # ============ SQUAT SCORING ============
+        squat_score = scores[ExerciseType.SQUAT]
+        w = self._weights["squat"]
+        
+        # Knee angle change (primary indicator)
+        knee_factor = min(1.0, knee_displacement / 60)
+        squat_score.add_factor("knee_displacement", knee_factor, w["knee_disp"])
+        
+        # Hip angle change
+        hip_factor = min(1.0, hip_displacement / 40)
+        squat_score.add_factor("hip_displacement", hip_factor, w["hip_disp"])
+        
+        # Hip vertical movement
+        hip_y_factor = min(1.0, hip_y_disp / 0.12)
+        squat_score.add_factor("hip_y_movement", hip_y_factor, w["hip_y_move"])
+        
+        # Upper body should be relatively stable
+        upper_stable = 1.0 - min(1.0, elbow_displacement / 80)
+        squat_score.add_factor("upper_body_stable", upper_stable, w["upper_stable"])
+        
+        # Penalty if horizontal
+        if is_horizontal:
+            squat_score.score *= 0.1
+        
+        return scores
+    
+    def identify_exercise(self) -> MotionAnalysis:
+        """
+        Analyze the motion buffer to identify the exercise.
+        Uses weighted multi-factor scoring for better accuracy.
+        
+        Returns:
+            MotionAnalysis with exercise type and confidence
+        """
+        if self.motion_buffer.size < 15:
+            return MotionAnalysis(
+                exercise_type=ExerciseType.UNKNOWN,
+                confidence=0.0
+            )
+        
+        # Calculate weighted scores for each exercise
+        scores = self._calculate_exercise_scores()
+        
+        # Get raw displacement values for the result
+        left_elbow_disp = self.motion_buffer.get_displacement("left_elbow")
+        right_elbow_disp = self.motion_buffer.get_displacement("right_elbow")
+        elbow_displacement = max(left_elbow_disp, right_elbow_disp)
+        
+        left_knee_disp = self.motion_buffer.get_displacement("left_knee")
+        right_knee_disp = self.motion_buffer.get_displacement("right_knee")
+        knee_displacement = max(left_knee_disp, right_knee_disp)
+        
+        left_hip_disp = self.motion_buffer.get_displacement("left_hip")
+        right_hip_disp = self.motion_buffer.get_displacement("right_hip")
+        hip_displacement = max(left_hip_disp, right_hip_disp)
+        
+        is_horizontal = self.motion_buffer.is_horizontal()
+        
+        # Find best matching exercise
+        best_exercise = ExerciseType.UNKNOWN
+        best_score = 0.0
+        classification_scores = {}
+        
+        min_score_threshold = 2.5  # Minimum score to consider valid
+        
+        for exercise_type, score_data in scores.items():
+            classification_scores[exercise_type.value] = {
+                "score": round(score_data.score, 2),
+                "factors": score_data.factors
+            }
             
-            if upper_body_score > lower_body_score * 1.3:
-                exercise_type = ExerciseType.BICEP_CURL
-                confidence = min(0.85, 0.4 + elbow_displacement / 120)
-                has_full_rep = self.motion_buffer.has_completed_rep("left_elbow", 40, 150)
-            elif lower_body_score > upper_body_score * 1.3:
-                exercise_type = ExerciseType.SQUAT
-                confidence = min(0.85, 0.4 + knee_displacement / 100)
-                has_full_rep = self.motion_buffer.has_completed_rep("left_knee", 70, 160)
+            if score_data.score > best_score and score_data.score >= min_score_threshold:
+                best_score = score_data.score
+                best_exercise = exercise_type
+        
+        # Calculate confidence (normalize score to 0-1)
+        max_possible_score = 7.0  # Approximate max weighted score
+        confidence = min(0.95, best_score / max_possible_score) if best_exercise != ExerciseType.UNKNOWN else 0.0
+        
+        # Check for full rep
+        has_full_rep = False
+        if best_exercise == ExerciseType.PUSHUP:
+            has_full_rep = self.motion_buffer.has_completed_rep("left_elbow", 70, 160)
+        elif best_exercise == ExerciseType.BICEP_CURL:
+            has_full_rep = (
+                self.motion_buffer.has_completed_rep("left_elbow", 40, 150) or
+                self.motion_buffer.has_completed_rep("right_elbow", 40, 150)
+            )
+        elif best_exercise == ExerciseType.SQUAT:
+            has_full_rep = (
+                self.motion_buffer.has_completed_rep("left_knee", 70, 160) or
+                self.motion_buffer.has_completed_rep("right_knee", 70, 160)
+            )
         
         # Update history
-        self._exercise_history.append(exercise_type)
+        self._exercise_history.append(best_exercise)
         self._confidence_history.append(confidence)
         
-        # Check for lock-in
+        # Lock-in logic: require consistent detection + full rep
         if has_full_rep and confidence >= settings.CONFIDENCE_THRESHOLD:
             if not self._locked_exercise:
-                self._locked_exercise = exercise_type
+                # Check consistency in recent history
+                recent = list(self._exercise_history)[-15:]
+                if recent.count(best_exercise) >= 10:
+                    self._locked_exercise = best_exercise
         
         return MotionAnalysis(
-            exercise_type=self._locked_exercise or exercise_type,
+            exercise_type=self._locked_exercise or best_exercise,
             confidence=confidence,
             elbow_displacement=elbow_displacement,
             knee_displacement=knee_displacement,
             hip_displacement=hip_displacement,
             is_horizontal=is_horizontal,
-            has_full_rep=has_full_rep
+            has_full_rep=has_full_rep,
+            classification_scores=classification_scores
         )
     
     def should_switch_exercise(self, new_exercise: ExerciseType, duration_seconds: float) -> bool:
@@ -375,8 +494,14 @@ class ExerciseClassifier:
         self._locked_exercise = None
         self._exercise_history.clear()
         self._confidence_history.clear()
+        self._landmark_smoother.reset()
+        self._angle_smoother.reset()
     
     @property
     def locked_exercise(self) -> Optional[ExerciseType]:
         """Currently locked exercise type."""
         return self._locked_exercise
+    
+    def get_smoothed_angles(self, angles: dict[str, float]) -> dict[str, float]:
+        """Get smoothed angles for display/analysis."""
+        return self._angle_smoother.smooth(angles)

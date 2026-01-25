@@ -20,10 +20,19 @@ class SquatModule(BaseExercise):
     KNEE_VALGUS_THRESHOLD = 0.03  # Normalized X difference threshold
     BACK_ANGLE_THRESHOLD = 45  # Maximum forward lean angle
     
+    # Hysteresis thresholds
+    ANGLE_HYSTERESIS = 12  # Degrees of buffer to prevent flickering
+    
     def __init__(self):
         super().__init__()
         self._lowest_knee_angle = 180.0
         self._in_squat = False
+        
+        # Create hysteresis-based rep counter for stable counting
+        self._create_rep_counter(
+            upper_threshold=self.MAX_KNEE_ANGLE - 10,  # ~150 degrees (standing)
+            lower_threshold=self.MIN_KNEE_ANGLE + 20   # ~90 degrees (parallel)
+        )
     
     @property
     def name(self) -> str:
@@ -117,10 +126,32 @@ class SquatModule(BaseExercise):
         return left_valgus, right_valgus
     
     def detect_rep_phase(self, landmarks: dict[JointName, Landmark]) -> str:
-        """Detect current phase of squat repetition."""
+        """Detect current phase of squat repetition with hysteresis rep counter."""
         angles = self._calculate_angles(landmarks)
         avg_knee_angle = (angles.left_knee + angles.right_knee) / 2
         
+        # Use hysteresis-based rep counter for stable phase detection
+        if self._rep_counter:
+            phase_str, rep_completed = self.update_rep_counter(
+                angle=avg_knee_angle,
+                left_angle=angles.left_knee,
+                right_angle=angles.right_knee
+            )
+            
+            # Track lowest angle for depth validation
+            self._lowest_knee_angle = min(self._lowest_knee_angle, avg_knee_angle)
+            
+            # Update internal state to match counter
+            if phase_str in ["up", "down", "hold"]:
+                self._in_squat = phase_str in ["down", "hold"]
+            
+            if rep_completed:
+                # Reset tracking for next rep
+                self._lowest_knee_angle = 180.0
+            
+            return phase_str
+        
+        # Fallback to legacy detection if counter not available
         if avg_knee_angle > self.MAX_KNEE_ANGLE - 10:
             # Standing position
             if self._in_squat:
