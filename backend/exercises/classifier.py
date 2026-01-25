@@ -91,6 +91,22 @@ class MotionBuffer:
                 landmarks[JointName.RIGHT_KNEE]
             )
             
+            # Wrist Y position (for tracking vertical hand movement)
+            angles["left_wrist_y"] = landmarks[JointName.LEFT_WRIST].y
+            angles["right_wrist_y"] = landmarks[JointName.RIGHT_WRIST].y
+            
+            # Elbow Y position 
+            angles["left_elbow_y"] = landmarks[JointName.LEFT_ELBOW].y
+            angles["right_elbow_y"] = landmarks[JointName.RIGHT_ELBOW].y
+            
+            # Hip Y position (for squat depth tracking)
+            angles["left_hip_y"] = landmarks[JointName.LEFT_HIP].y
+            angles["right_hip_y"] = landmarks[JointName.RIGHT_HIP].y
+            
+            # Shoulder Y position
+            angles["left_shoulder_y"] = landmarks[JointName.LEFT_SHOULDER].y
+            angles["right_shoulder_y"] = landmarks[JointName.RIGHT_SHOULDER].y
+            
             # Body orientation
             mid_shoulder_y = (landmarks[JointName.LEFT_SHOULDER].y + 
                              landmarks[JointName.RIGHT_SHOULDER].y) / 2
@@ -208,7 +224,7 @@ class ExerciseClassifier:
                 confidence=0.0
             )
         
-        # Calculate displacements for key joints
+        # Calculate displacements for key joints (angle changes)
         left_elbow_disp = self.motion_buffer.get_displacement("left_elbow")
         right_elbow_disp = self.motion_buffer.get_displacement("right_elbow")
         elbow_displacement = max(left_elbow_disp, right_elbow_disp)
@@ -221,30 +237,82 @@ class ExerciseClassifier:
         right_hip_disp = self.motion_buffer.get_displacement("right_hip")
         hip_displacement = max(left_hip_disp, right_hip_disp)
         
+        # Calculate positional displacements (y-axis movement)
+        wrist_y_disp = max(
+            self.motion_buffer.get_displacement("left_wrist_y"),
+            self.motion_buffer.get_displacement("right_wrist_y")
+        )
+        hip_y_disp = max(
+            self.motion_buffer.get_displacement("left_hip_y"),
+            self.motion_buffer.get_displacement("right_hip_y")
+        )
+        shoulder_y_disp = max(
+            self.motion_buffer.get_displacement("left_shoulder_y"),
+            self.motion_buffer.get_displacement("right_shoulder_y")
+        )
+        
         is_horizontal = self.motion_buffer.is_horizontal()
         
-        # Classification logic based on greatest displacement
+        # Classification logic - IMPROVED with multi-factor analysis
         exercise_type = ExerciseType.UNKNOWN
         confidence = 0.0
         has_full_rep = False
         
-        # Push-up: body horizontal + elbow/shoulder movement
+        # ============ PUSH-UP ============
+        # Body horizontal + significant elbow angle change
         if is_horizontal and elbow_displacement > 30:
             exercise_type = ExerciseType.PUSHUP
             confidence = min(0.95, 0.5 + elbow_displacement / 100)
             has_full_rep = self.motion_buffer.has_completed_rep("left_elbow", 70, 160)
         
-        # Squat: knee/hip displacement is greatest (body vertical)
-        elif knee_displacement > elbow_displacement and knee_displacement > 30:
-            exercise_type = ExerciseType.SQUAT
-            confidence = min(0.95, 0.5 + knee_displacement / 100)
-            has_full_rep = self.motion_buffer.has_completed_rep("left_knee", 70, 160)
-        
-        # Bicep curl: elbow displacement is greatest (body vertical)
-        elif elbow_displacement > knee_displacement and elbow_displacement > 40:
+        # ============ BICEP CURL ============
+        # Key indicators:
+        # 1. Elbow angle changes significantly (arm bending)
+        # 2. Wrist moves vertically (hand going up/down)
+        # 3. Hips stay relatively stable (not squatting)
+        # 4. Shoulders stay stable (not doing overhead press)
+        elif (elbow_displacement > 35 and 
+              wrist_y_disp > 0.05 and  # Wrist moves vertically
+              hip_y_disp < 0.08 and    # Hips stay stable (not squatting)
+              shoulder_y_disp < 0.06 and  # Shoulders stable (not jumping)
+              knee_displacement < elbow_displacement * 0.8):  # Elbows move more than knees
             exercise_type = ExerciseType.BICEP_CURL
-            confidence = min(0.95, 0.5 + elbow_displacement / 120)
-            has_full_rep = self.motion_buffer.has_completed_rep("left_elbow", 30, 160)
+            # Higher confidence if elbow displacement is much greater than knee
+            elbow_knee_ratio = elbow_displacement / max(knee_displacement, 1)
+            confidence = min(0.95, 0.4 + elbow_displacement / 100 + min(elbow_knee_ratio * 0.1, 0.3))
+            has_full_rep = self.motion_buffer.has_completed_rep("left_elbow", 40, 150) or \
+                           self.motion_buffer.has_completed_rep("right_elbow", 40, 150)
+        
+        # ============ SQUAT ============
+        # Key indicators:
+        # 1. Knee angle changes significantly
+        # 2. Hip moves down (y increases in normalized coords)
+        # 3. Hip angle changes (bending at hips)
+        # 4. Upper body stays relatively stable (wrists not moving much)
+        elif (knee_displacement > 30 and 
+              hip_displacement > 15 and  # Hip angle must change for squat
+              hip_y_disp > 0.03 and      # Hips move vertically
+              (wrist_y_disp < 0.1 or knee_displacement > elbow_displacement * 1.5)):  # Not curling
+            exercise_type = ExerciseType.SQUAT
+            confidence = min(0.95, 0.4 + knee_displacement / 100 + hip_displacement / 100)
+            has_full_rep = self.motion_buffer.has_completed_rep("left_knee", 70, 160) or \
+                           self.motion_buffer.has_completed_rep("right_knee", 70, 160)
+        
+        # ============ FALLBACK DETECTION ============
+        # If still unknown but there's clear movement, try ratio-based detection
+        elif elbow_displacement > 40 or knee_displacement > 40:
+            # Compare upper body vs lower body movement
+            upper_body_score = elbow_displacement + wrist_y_disp * 100
+            lower_body_score = knee_displacement + hip_displacement + hip_y_disp * 100
+            
+            if upper_body_score > lower_body_score * 1.3:
+                exercise_type = ExerciseType.BICEP_CURL
+                confidence = min(0.85, 0.4 + elbow_displacement / 120)
+                has_full_rep = self.motion_buffer.has_completed_rep("left_elbow", 40, 150)
+            elif lower_body_score > upper_body_score * 1.3:
+                exercise_type = ExerciseType.SQUAT
+                confidence = min(0.85, 0.4 + knee_displacement / 100)
+                has_full_rep = self.motion_buffer.has_completed_rep("left_knee", 70, 160)
         
         # Update history
         self._exercise_history.append(exercise_type)
