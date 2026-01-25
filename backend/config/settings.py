@@ -1,8 +1,21 @@
 """Application settings with environment variable support."""
 
-from typing import Optional, Union
+import os
+from typing import Optional, List
 from pydantic_settings import BaseSettings
-from pydantic import field_validator
+
+
+def get_cors_origins() -> List[str]:
+    """Parse CORS_ORIGINS from environment or return defaults."""
+    env_value = os.environ.get('CORS_ORIGINS', '')
+    if env_value:
+        return [origin.strip() for origin in env_value.split(',') if origin.strip()]
+    return [
+        "http://localhost:3000", 
+        "http://localhost:5173",
+        "https://exercise-form-correction.vercel.app",
+        "https://*.vercel.app",
+    ]
 
 
 class Settings(BaseSettings):
@@ -12,22 +25,6 @@ class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
     PORT: int = 8000
     DEBUG: bool = True
-    
-    # CORS settings - accepts comma-separated string or JSON array
-    CORS_ORIGINS: list[str] = [
-        "http://localhost:3000", 
-        "http://localhost:5173",
-        "https://exercise-form-correction.vercel.app",
-        "https://*.vercel.app",
-    ]
-    
-    @field_validator('CORS_ORIGINS', mode='before')
-    @classmethod
-    def parse_cors_origins(cls, v):
-        """Parse CORS_ORIGINS from comma-separated string or list."""
-        if isinstance(v, str):
-            return [origin.strip() for origin in v.split(',') if origin.strip()]
-        return v
     
     # Upload settings
     UPLOAD_DIR: str = "./uploads"
@@ -45,6 +42,11 @@ class Settings(BaseSettings):
     SUPABASE_URL: Optional[str] = None
     SUPABASE_KEY: Optional[str] = None
     SUPABASE_SERVICE_ROLE_KEY: Optional[str] = None
+    
+    @property
+    def CORS_ORIGINS(self) -> List[str]:
+        """Get CORS origins from environment."""
+        return get_cors_origins()
     
     class Config:
         env_file = ".env"
