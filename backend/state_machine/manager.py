@@ -10,7 +10,7 @@ from exercises.base import BaseExercise, ExerciseResult, landmarks_to_dict, Join
 from exercises.classifier import ExerciseClassifier, ExerciseType, MotionAnalysis
 from exercises.squat import SquatModule
 from exercises.pushup import PushupModule
-from exercises.bicep_curl import BicepCurlModule
+from exercises.bicep_curl import BicepCurlModule, AlternateBicepCurlModule
 
 
 class SystemState(str, Enum):
@@ -51,6 +51,7 @@ class FormManager:
         ExerciseType.SQUAT: SquatModule,
         ExerciseType.PUSHUP: PushupModule,
         ExerciseType.BICEP_CURL: BicepCurlModule,
+        ExerciseType.ALTERNATE_BICEP_CURL: AlternateBicepCurlModule,
     }
     
     def __init__(self):

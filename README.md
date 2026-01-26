@@ -15,12 +15,30 @@ This application uses **MediaPipe Pose Landmarker** to detect human body poses i
 ### ✨ Key Features
 
 - **🎯 Real-time Pose Detection** - Client-side ML using MediaPipe Tasks Vision
-- **🏃 Exercise Recognition** - Automatically detects Squats, Push-ups, and Bicep Curls
-- **🔢 Rep Counting** - Accurate repetition counting with phase detection (up/down/hold)
+- **🏃 Exercise Recognition** - Automatically detects Squats, Push-ups, Bicep Curls (standing/seated), and Alternate Curls
+- **🔢 Rep Counting (Hysteresis + State Machine)** - More stable counting that resists jitter and phase flicker
+- **📈 Rep Quality Scoring** - Tracks rep quality signals (tempo/range/symmetry) for better coaching feedback
 - **⚠️ Form Correction** - Visual and text feedback on form violations
 - **🎨 Joint Highlighting** - Color-coded joint visualization (green/yellow/red)
+- **🧠 Pose Smoothing (EMA + Outlier Rejection)** - Landmark smoothing for steadier angles and fewer false triggers
 - **📹 Video Upload** - Analyze pre-recorded workout videos
 - **🔌 WebSocket Streaming** - Low-latency real-time communication
+
+---
+
+## 🌐 Live Deployment
+
+- Frontend (Vercel): `https://frontend-beta-livid-70.vercel.app`
+- Backend (Render): `https://exercise-form-backend.onrender.com`
+
+### WebSocket (Production)
+
+- Endpoint: `wss://exercise-form-backend.onrender.com/api/ws/pose/{client_id}`
+- `client_id` can be any unique identifier (e.g. `device-123`, `user-abc`, a UUID)
+
+### Frontend Config
+
+- Set `VITE_API_URL=https://exercise-form-backend.onrender.com`
 
 ---
 
@@ -285,7 +303,8 @@ Frontend will be available at: `http://localhost:3000`
 |----------|-----------|--------------|-------------|
 | **Squat** | ✅ | ✅ | Knee valgus, depth, back angle |
 | **Push-up** | ✅ | ✅ | Elbow flare, hip sag, depth |
-| **Bicep Curl** | ✅ | ✅ | Elbow drift, body swing, ROM |
+| **Bicep Curl (Standing/Seated)** | ✅ | ✅ | Elbow drift, body swing (seat-aware), ROM |
+| **Alternate Bicep Curl** | ✅ | ✅ | Alternation checks, resting arm extension, left/right balance |
 | *Lunge* | 🔜 Planned | - | - |
 | *Deadlift* | 🔜 Planned | - | - |
 | *Plank* | 🔜 Planned | - | - |
@@ -373,6 +392,25 @@ Frontend will be available at: `http://localhost:3000`
 
 ```
 WS /api/ws/pose/{client_id}
+```
+
+**Example (Browser / PWA):**
+
+```js
+const clientId = "pwa-1";
+const ws = new WebSocket(`wss://exercise-form-backend.onrender.com/api/ws/pose/${clientId}`);
+
+ws.onopen = () => console.log("WS connected");
+ws.onmessage = (e) => {
+  const msg = JSON.parse(e.data);
+  console.log(msg.current_exercise, msg.rep_count, msg.violations);
+};
+
+// Send MediaPipe pose landmarks (33 items)
+ws.send(JSON.stringify({
+  landmarks: [...],
+  timestamp: Date.now()
+}));
 ```
 
 **Send (Client → Server):**
