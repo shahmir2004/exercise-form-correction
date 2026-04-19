@@ -1,504 +1,264 @@
-# 🏋️ Exercise Form Detection & Correction
+# Backend
 
-> Real-time AI-powered exercise form analysis using computer vision
+FastAPI backend for real-time exercise form correction.
 
-[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://python.org)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.2-blue.svg)](https://typescriptlang.org)
-[![React](https://img.shields.io/badge/React-18.2-61DAFB.svg)](https://reactjs.org)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.128-009688.svg)](https://fastapi.tiangolo.com)
-[![MediaPipe](https://img.shields.io/badge/MediaPipe-Tasks--Vision-orange.svg)](https://mediapipe.dev)
+This service receives pose landmarks from the frontend over WebSocket, classifies the exercise, runs the active exercise module, and returns rep state, form feedback, and joint highlighting data. It also exposes chunked upload endpoints for video analysis.
 
-## 📋 Overview
+## Overview
 
-This application uses **MediaPipe Pose Landmarker** to detect human body poses in real-time and provides intelligent feedback on exercise form. It can identify different exercises, count repetitions, and highlight form violations to help users exercise safely and effectively.
+The backend is responsible for:
 
-### ✨ Key Features
+- Accepting pose landmark frames from clients.
+- Managing per-client exercise state.
+- Classifying the active exercise.
+- Running exercise-specific form checks and rep counting.
+- Serving upload APIs for chunked video ingestion.
+- Exposing a health endpoint for deployment checks.
 
-- **🎯 Real-time Pose Detection** - Client-side ML using MediaPipe Tasks Vision
-- **🏃 Exercise Recognition** - Automatically detects Squats, Push-ups, Bicep Curls (standing/seated), and Alternate Curls
-- **🔢 Rep Counting (Hysteresis + State Machine)** - More stable counting that resists jitter and phase flicker
-- **📈 Rep Quality Scoring** - Tracks rep quality signals (tempo/range/symmetry) for better coaching feedback
-- **⚠️ Form Correction** - Visual and text feedback on form violations
-- **🎨 Joint Highlighting** - Color-coded joint visualization (green/yellow/red)
-- **🧠 Pose Smoothing (EMA + Outlier Rejection)** - Landmark smoothing for steadier angles and fewer false triggers
-- **📹 Video Upload** - Analyze pre-recorded workout videos
-- **🔌 WebSocket Streaming** - Low-latency real-time communication
+## Tech Stack
 
----
+- FastAPI for HTTP and WebSocket routing.
+- Uvicorn as the ASGI server.
+- Pydantic for request and response validation.
+- aiofiles for async file handling.
+- NumPy for pose and angle math.
 
-## 🌐 Live Deployment
+## Project Structure
 
-- Frontend (Vercel): `https://frontend-beta-livid-70.vercel.app`
-- Backend (Render): `https://exercise-form-backend.onrender.com`
-
-### WebSocket (Production)
-
-- Endpoint: `wss://exercise-form-backend.onrender.com/api/ws/pose/{client_id}`
-- `client_id` can be any unique identifier (e.g. `device-123`, `user-abc`, a UUID)
-
-### Frontend Config
-
-- Set `VITE_API_URL=https://exercise-form-backend.onrender.com`
-
----
-
-## 🏗️ Architecture
-
-### System Overview
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        FRONTEND (React)                         │
-├─────────────────────────────────────────────────────────────────┤
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐   │
-│  │ Video Source │──│ PoseDetector │──│ Canvas Overlay       │   │
-│  │ (File/Camera)│  │ (MediaPipe)  │  │ (Skeleton Drawing)   │   │
-│  └──────────────┘  └──────┬───────┘  └──────────────────────┘   │
-│                           │ 33 Landmarks                         │
-│                           ▼                                      │
-│                    ┌─────────────┐                               │
-│                    │  WebSocket  │                               │
-│                    │   Client    │                               │
-│                    └──────┬──────┘                               │
-└───────────────────────────│─────────────────────────────────────┘
-                            │ JSON (landmarks + timestamp)
-                            ▼
-┌───────────────────────────│─────────────────────────────────────┐
-│                    ┌──────┴──────┐                               │
-│                    │  WebSocket  │         BACKEND (FastAPI)     │
-│                    │   Server    │                               │
-│                    └──────┬──────┘                               │
-│                           │                                      │
-│  ┌────────────────────────┼────────────────────────────────┐     │
-│  │              State Machine Manager                       │     │
-│  │  ┌─────────┐    ┌──────────┐    ┌─────────────────┐     │     │
-│  │  │  IDLE   │───▶│ SCANNING │───▶│     ACTIVE      │     │     │
-│  │  │         │◀───│          │◀───│ (Counting Reps) │     │     │
-│  │  └─────────┘    └──────────┘    └─────────────────┘     │     │
-│  └─────────────────────────────────────────────────────────┘     │
-│                           │                                      │
-│  ┌────────────────────────┼────────────────────────────────┐     │
-│  │              Exercise Classifier                         │     │
-│  │  Analyzes joint angles to identify exercise type         │     │
-│  └────────────────────────┼────────────────────────────────┘     │
-│                           │                                      │
-│  ┌────────────────────────┴────────────────────────────────┐     │
-│  │              Exercise Modules (Pluggable)                │     │
-│  │  ┌─────────┐    ┌──────────┐    ┌─────────────────┐     │     │
-│  │  │  Squat  │    │ Push-up  │    │   Bicep Curl    │     │     │
-│  │  │ Module  │    │  Module  │    │     Module      │     │     │
-│  │  └─────────┘    └──────────┘    └─────────────────┘     │     │
-│  └─────────────────────────────────────────────────────────┘     │
-└─────────────────────────────────────────────────────────────────┘
+```text
+backend/
+├── main.py               # FastAPI application entry point
+├── api/
+│   ├── routes.py         # WebSocket pose endpoint + health/reset routes
+│   └── upload.py         # Chunked upload lifecycle
+├── config/
+│   └── settings.py       # Environment-driven settings
+├── database/
+│   └── client.py         # Database abstraction
+├── exercises/
+│   ├── base.py           # Base exercise contract
+│   ├── classifier.py    # Exercise identification
+│   ├── squat.py         # Squat module
+│   ├── pushup.py        # Push-up module
+│   └── bicep_curl.py    # Bicep curl modules
+├── state_machine/
+│   └── manager.py        # Session and exercise state transitions
+├── utils/
+│   ├── rep_counter.py    # Hysteresis-based rep counting
+│   └── smoothing.py      # Landmark and angle smoothing
+└── uploads/              # Stored uploaded videos and chunk data
 ```
 
----
-
-## 📁 Project Structure
-
-### Modular Architecture
-
-The project follows a **modular, plugin-based architecture** that makes it easy to:
-- Add new exercises without modifying core logic
-- Test exercises in isolation
-- Swap out components (e.g., different pose detection models)
-- Scale horizontally for multiple users
-
-```
-exercise-form-correction/
-│
-├── 📂 frontend/                    # React + TypeScript + Vite
-│   ├── 📂 src/
-│   │   ├── 📂 components/          # UI Components
-│   │   │   ├── ExerciseDisplay.tsx    # Shows current exercise, reps, feedback
-│   │   │   ├── VideoCanvas.tsx        # Video player with skeleton overlay
-│   │   │   ├── VideoUpload.tsx        # Drag-and-drop file upload
-│   │   │   └── ControlPanel.tsx       # Play/pause/reset controls
-│   │   │
-│   │   ├── 📂 hooks/               # Custom React Hooks
-│   │   │   ├── usePoseStream.ts       # WebSocket connection management
-│   │   │   └── useVideoProcessor.ts   # Video + pose detection pipeline
-│   │   │
-│   │   ├── 📂 pose/                # Pose Detection Module
-│   │   │   ├── PoseDetector.ts        # MediaPipe wrapper
-│   │   │   ├── MotionBuffer.ts        # Temporal smoothing
-│   │   │   └── index.ts               # Public exports
-│   │   │
-│   │   ├── 📂 video/               # Video Source Module
-│   │   │   ├── VideoSource.ts         # Abstract video interface
-│   │   │   ├── FileVideoSource.ts     # File-based video
-│   │   │   └── CameraSource.ts        # Webcam capture
-│   │   │
-│   │   ├── App.tsx                 # Main application
-│   │   └── main.tsx                # Entry point
-│   │
-│   ├── package.json
-│   └── vite.config.ts
-│
-├── 📂 backend/                     # FastAPI + Python
-│   ├── 📂 api/                     # API Layer
-│   │   ├── routes.py                  # WebSocket endpoints
-│   │   └── upload.py                  # Video upload endpoints
-│   │
-│   ├── 📂 exercises/               # Exercise Modules (PLUGGABLE)
-│   │   ├── base.py                    # BaseExercise abstract class
-│   │   ├── squat.py                   # Squat detection & form checks
-│   │   ├── pushup.py                  # Push-up module
-│   │   ├── bicep_curl.py              # Bicep curl module
-│   │   └── __init__.py                # Module registry
-│   │
-│   ├── 📂 state_machine/           # Session State Management
-│   │   └── manager.py                 # IDLE → SCANNING → ACTIVE
-│   │
-│   ├── 📂 config/                  # Configuration
-│   │   └── settings.py                # Environment settings
-│   │
-│   ├── main.py                     # FastAPI application
-│   └── requirements.txt
-│
-├── .gitignore
-└── README.md
-```
-
----
-
-## 🔌 Modular Design Philosophy
-
-### Adding a New Exercise
-
-The system is designed so that **adding a new exercise requires only creating a single file**:
-
-```python
-# backend/exercises/lunge.py
-
-from .base import BaseExercise, ExerciseResult, JointAngles
-
-class LungeModule(BaseExercise):
-    """Lunge exercise detection and form correction."""
-    
-    # Define angle thresholds
-    FRONT_KNEE_ANGLE_MIN = 80
-    FRONT_KNEE_ANGLE_MAX = 100
-    
-    @property
-    def name(self) -> str:
-        return "Lunge"
-    
-    @property
-    def required_joints(self) -> list:
-        return [JointName.LEFT_KNEE, JointName.RIGHT_KNEE, ...]
-    
-    def detect_rep_phase(self, landmarks) -> str:
-        # Implement phase detection
-        pass
-    
-    def check_form(self, landmarks) -> ExerciseResult:
-        # Implement form validation
-        pass
-```
-
-Then register it in `exercises/__init__.py`:
-
-```python
-from .lunge import LungeModule
-
-EXERCISE_MODULES = {
-    "squat": SquatModule,
-    "pushup": PushupModule,
-    "bicep_curl": BicepCurlModule,
-    "lunge": LungeModule,  # ← Just add this line!
-}
-```
-
-### Key Design Patterns
-
-| Pattern | Implementation | Benefit |
-|---------|---------------|---------|
-| **Strategy** | Exercise modules | Swap algorithms at runtime |
-| **State Machine** | Session manager | Clean state transitions |
-| **Observer** | Pose callbacks | Decouple detection from UI |
-| **Factory** | Exercise registry | Dynamic module loading |
-| **Adapter** | Video sources | Unified interface for file/camera |
-
----
-
-## 🚀 Getting Started
+## Local Setup
 
 ### Prerequisites
 
-- **Node.js** 18+ (for frontend)
-- **Python** 3.10+ (for backend)
-- **Git**
+- Python 3.10 or newer.
+- A virtual environment is recommended.
 
-### Installation
+### Install Dependencies
 
-#### 1. Clone the Repository
-
-```bash
-git clone https://github.com/shahmir2004/exercise-form-correction.git
-cd exercise-form-correction
-```
-
-#### 2. Set Up Backend
+From the repository root:
 
 ```bash
-# Create virtual environment
-python -m venv .venv
-
-# Activate virtual environment
-# Windows:
-.venv\Scripts\activate
-# macOS/Linux:
-source .venv/bin/activate
-
-# Install dependencies
 pip install -r backend/requirements.txt
 ```
 
-#### 3. Set Up Frontend
+### Run the API
 
 ```bash
-cd frontend
-npm install
-```
-
-### Running the Application
-
-#### Start Backend Server
-
-```bash
-# From project root, with venv activated
 cd backend
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Backend will be available at: `http://localhost:8000`
+### Verify It Is Running
 
-#### Start Frontend Development Server
+- Root: `GET /`
+- Health: `GET /api/health`
+- OpenAPI docs: `GET /docs`
+
+## Environment Variables
+
+The backend reads settings from environment variables and a local `.env` file.
+
+### Common Settings
+
+- `HOST`: bind address for local development. Default: `0.0.0.0`
+- `PORT`: server port. Default: `8000`
+- `DEBUG`: reload/debug mode. Default: `True`
+- `CORS_ORIGINS`: comma-separated allowed frontend origins or `*`
+- `UPLOAD_DIR`: directory for completed uploads. Default: `./uploads`
+- `CHUNK_DIR`: directory for temporary chunk storage. Default: `./uploads/chunks`
+- `MAX_FILE_SIZE`: maximum upload size. Default: `5GB`
+- `CHUNK_SIZE`: upload chunk size. Default: `5MB`
+- `MOTION_BUFFER_SIZE`: frame buffer size used by motion analysis. Default: `60`
+- `CONFIDENCE_THRESHOLD`: minimum confidence for exercise detection. Default: `0.80`
+- `EXERCISE_SWITCH_DELAY`: delay before switching exercises. Default: `2.0`
+
+## CORS
+
+The backend allows local development origins and Vercel-style origins by default. For production, set `CORS_ORIGINS` explicitly to your deployed frontend URL(s).
+
+Example:
 
 ```bash
-# In a new terminal
-cd frontend
-npm run dev
+CORS_ORIGINS=https://your-frontend.vercel.app,https://www.yourdomain.com
 ```
 
-Frontend will be available at: `http://localhost:3000`
+## WebSocket API
 
-### Usage
+### Endpoint
 
-1. Open `http://localhost:3000` in your browser
-2. Click **"Upload Video"** or drag and drop a workout video
-3. Click **"Start Processing"** to begin analysis
-4. Watch real-time feedback as the video plays:
-   - Skeleton overlay on your body
-   - Exercise type detection
-   - Rep counter
-   - Form corrections
-
----
-
-## 📊 Supported Exercises
-
-| Exercise | Detection | Rep Counting | Form Checks |
-|----------|-----------|--------------|-------------|
-| **Squat** | ✅ | ✅ | Knee valgus, depth, back angle |
-| **Push-up** | ✅ | ✅ | Elbow flare, hip sag, depth |
-| **Bicep Curl (Standing/Seated)** | ✅ | ✅ | Elbow drift, body swing (seat-aware), ROM |
-| **Alternate Bicep Curl** | ✅ | ✅ | Alternation checks, resting arm extension, left/right balance |
-| *Lunge* | 🔜 Planned | - | - |
-| *Deadlift* | 🔜 Planned | - | - |
-| *Plank* | 🔜 Planned | - | - |
-
----
-
-## 🔮 Future Roadmap
-
-### Phase 1: Web Application Enhancement (Q1 2026)
-- [ ] **Webcam Support** - Real-time camera analysis
-- [ ] **User Accounts** - Save workout history
-- [ ] **Workout Sessions** - Multi-exercise routines
-- [ ] **Progress Tracking** - Charts and statistics
-- [ ] **Video Recording** - Save analyzed sessions
-
-### Phase 2: Full Fitness Platform (Q2 2026)
-- [ ] **Calorie Management**
-  - Food logging with barcode scanning
-  - Macro tracking (protein, carbs, fats)
-  - Daily calorie goals based on activity
-  - Integration with fitness trackers
-  
-- [ ] **Workout Plans**
-  - Pre-built exercise programs
-  - Custom routine builder
-  - Rest day scheduling
-  - Progressive overload tracking
-
-- [ ] **Social Features**
-  - Share workouts with friends
-  - Challenges and competitions
-  - Leaderboards
-
-### Phase 3: Mobile Application (Q3 2026)
-- [ ] **React Native App**
-  - iOS and Android support
-  - Offline mode for form checking
-  - Push notifications for reminders
-  
-- [ ] **Wearable Integration**
-  - Apple Watch / Wear OS companion
-  - Heart rate monitoring during exercises
-  - Automatic rep detection from motion sensors
-
-### Phase 4: AI Enhancements (Q4 2026)
-- [ ] **Personalized Coaching**
-  - ML-based form improvement suggestions
-  - Injury risk prediction
-  - Adaptive difficulty
-  
-- [ ] **Voice Feedback**
-  - Real-time audio cues
-  - "Lower your hips" spoken during squats
-  
-- [ ] **3D Pose Analysis**
-  - Depth camera support
-  - More accurate joint angles
-
----
-
-## 🛠️ Tech Stack
-
-### Frontend
-- **React 18** - UI framework
-- **TypeScript** - Type safety
-- **Vite** - Build tool
-- **Tailwind CSS** - Styling
-- **MediaPipe Tasks Vision** - Client-side pose detection
-
-### Backend
-- **FastAPI** - Python web framework
-- **WebSockets** - Real-time communication
-- **Uvicorn** - ASGI server
-- **NumPy** - Numerical computations
-
-### ML/AI
-- **MediaPipe PoseLandmarker** - 33-point body pose estimation
-- **GPU Acceleration** - WebGL-based inference
-
----
-
-## 📄 API Reference
-
-### WebSocket Endpoint
-
-```
+```text
 WS /api/ws/pose/{client_id}
 ```
 
-**Example (Browser / PWA):**
+`client_id` should be a stable unique identifier per browser session or device.
 
-```js
-const clientId = "pwa-1";
-const ws = new WebSocket(`wss://exercise-form-backend.onrender.com/api/ws/pose/${clientId}`);
+### Client To Server Payload
 
-ws.onopen = () => console.log("WS connected");
-ws.onmessage = (e) => {
-  const msg = JSON.parse(e.data);
-  console.log(msg.current_exercise, msg.rep_count, msg.violations);
-};
+The client sends a JSON object with pose landmarks and a timestamp:
 
-// Send MediaPipe pose landmarks (33 items)
-ws.send(JSON.stringify({
-  landmarks: [...],
-  timestamp: Date.now()
-}));
-```
-
-**Send (Client → Server):**
 ```json
 {
   "landmarks": [
-    {"x": 0.5, "y": 0.3, "z": -0.1, "visibility": 0.99},
-    // ... 33 landmarks total
+    {"x": 0.5, "y": 0.3, "z": -0.1, "visibility": 0.99}
   ],
   "timestamp": 1234567890.123
 }
 ```
 
-**Receive (Server → Client):**
+The landmarks list should contain 33 MediaPipe pose landmarks.
+
+### Server Response
+
+The backend returns a `FormCorrectionResponse` payload containing:
+
+- `state`
+- `current_exercise`
+- `exercise_display`
+- `rep_count`
+- `rep_phase`
+- `is_rep_valid`
+- `violations`
+- `corrections`
+- `correction_message`
+- `joint_colors`
+- `confidence`
+- `timestamp`
+
+Example:
+
 ```json
 {
   "state": "active",
-  "current_exercise": "bicep_curl",
-  "exercise_display": "Bicep Curl",
-  "rep_count": 5,
-  "rep_phase": "up",
+  "current_exercise": "squat",
+  "exercise_display": "Squat",
+  "rep_count": 3,
+  "rep_phase": "down",
   "is_rep_valid": true,
   "violations": [],
   "corrections": [],
-  "correction_message": "Good form!",
-  "joint_colors": {
-    "left_elbow": "green",
-    "right_elbow": "green"
-  },
-  "confidence": 0.95
+  "correction_message": "Great form! Keep it up!",
+  "joint_colors": {},
+  "confidence": 0.94,
+  "timestamp": 1234567890.123
 }
 ```
 
----
+## HTTP API
 
-## 🤝 Contributing
+### Root
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+`GET /`
 
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
+Returns the service name, version, docs path, and health path.
 
----
+### Health Check
 
-## 📝 License
+`GET /api/health`
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+Returns a simple healthy response and active WebSocket connection count.
 
----
+### Reset Session
 
-## 👥 Authors & Collaborators
+`POST /api/reset/{client_id}`
 
-<table>
-  <tr>
-    <td align="center">
-      <a href="https://github.com/shahmir2004">
-        <img src="https://github.com/shahmir2004.png" width="100px;" alt="Muhammad Shahmir Ahmed"/><br />
-        <sub><b>Muhammad Shahmir Ahmed</b></sub>
-      </a><br />
-      <sub>Lead Developer</sub>
-    </td>
-    <td align="center">
-      <a href="https://github.com/ABDULLAHAZHERCH">
-        <img src="https://github.com/ABDULLAHAZHERCH.png" width="100px;" alt="Abdullah Azher Chaudry"/><br />
-        <sub><b>Abdullah Azher Chaudry</b></sub>
-      </a><br />
-      <sub>Lead Developer</sub>
-    </td>
-  </tr>
-</table>
+Resets the session state for a specific client.
 
-**Muhammad Shahmir Ahmed** - [Portfolio](https://shahmir-ahmed.vercel.app) · [GitHub](https://github.com/shahmir2004)
+## Upload API
 
-**Abdullah Azher Chaudry** - [Portfolio](https://abdullahch.vercel.app) · [GitHub](https://github.com/ABDULLAHAZHERCH)
+The upload flow supports chunked file upload for larger workout videos.
 
----
+### Initialize Upload
 
-## 🙏 Acknowledgments
+`POST /api/upload/init`
 
-- [MediaPipe](https://mediapipe.dev/) for the amazing pose detection model
-- [FastAPI](https://fastapi.tiangolo.com/) for the elegant Python framework
-- [React](https://reactjs.org/) for the frontend framework
+Creates a new upload session and returns an `upload_id` plus server chunk size.
 
----
+### Upload A Chunk
 
-<p align="center">
-  Made with ❤️ for fitness enthusiasts everywhere
-</p>
+`POST /api/upload/chunk/{upload_id}?chunk_index=N`
+
+Uploads one file chunk for the session.
+
+### Check Status
+
+`GET /api/upload/status/{upload_id}`
+
+Returns progress and uploaded chunk indices.
+
+### Complete Upload
+
+`POST /api/upload/complete/{upload_id}`
+
+Assembles all chunks into the final file and schedules cleanup.
+
+### Cancel Upload
+
+`DELETE /api/upload/{upload_id}`
+
+Cancels the upload session and removes stored chunks.
+
+## Deployment Notes
+
+This backend is an always-on API and WebSocket server. It is not a good fit for Vercel serverless deployment because the application keeps long-lived WebSocket connections open.
+
+Recommended deployment targets:
+
+- Render
+- Fly.io
+- Railway
+- A small VPS or container host
+
+If you deploy the frontend on Vercel, point the browser to the backend WebSocket endpoint using the backend deployment URL, for example:
+
+```text
+wss://your-backend-domain/api/ws/pose/{client_id}
+```
+
+## Frontend Integration
+
+Set the frontend API base URL to the backend deployment:
+
+```bash
+VITE_API_URL=https://your-backend-domain
+```
+
+The frontend derives the WebSocket URL from this value.
+
+## Troubleshooting
+
+- If the WebSocket does not connect, confirm `VITE_API_URL` points to the backend and not the frontend.
+- If the browser blocks the connection, verify `CORS_ORIGINS` includes the deployed frontend domain.
+- If uploads fail, confirm the backend process has write access to `UPLOAD_DIR` and `CHUNK_DIR`.
+- If rep counting or exercise switching seems unstable, check the smoothing and state machine thresholds in `config/settings.py` and the exercise modules.
+
+## Related Files
+
+- [backend/main.py](main.py)
+- [backend/api/routes.py](api/routes.py)
+- [backend/api/upload.py](api/upload.py)
+- [backend/config/settings.py](config/settings.py)
+- [backend/exercises/classifier.py](exercises/classifier.py)
+- [backend/state_machine/manager.py](state_machine/manager.py)
