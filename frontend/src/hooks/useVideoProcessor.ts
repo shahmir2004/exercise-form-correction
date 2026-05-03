@@ -83,6 +83,15 @@ export function useVideoProcessor(options: UseVideoProcessorOptions = {}): UseVi
     callbacksRef.current = { onPoseResult, onError };
   }, [onPoseResult, onError]);
 
+  const stopProcessingInternal = useCallback(() => {
+    isProcessingRef.current = false;
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+    setIsProcessing(false);
+  }, []);
+
   // Initialize pose detector ONCE on mount
   useEffect(() => {
     let mounted = true;
@@ -269,15 +278,6 @@ export function useVideoProcessor(options: UseVideoProcessorOptions = {}): UseVi
 
     animationFrameRef.current = requestAnimationFrame(processFrame);
   }, []); // No dependencies - uses refs
-
-  const stopProcessingInternal = useCallback(() => {
-    isProcessingRef.current = false;
-    if (animationFrameRef.current) {
-      cancelAnimationFrame(animationFrameRef.current);
-      animationFrameRef.current = null;
-    }
-    setIsProcessing(false);
-  }, []);
 
   const startProcessing = useCallback(() => {
     if (!isPoseReady || !videoElement) {
