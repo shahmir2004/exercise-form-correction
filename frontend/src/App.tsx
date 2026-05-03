@@ -23,11 +23,15 @@ function App() {
     duration,
     currentTime,
     loadFile,
+    startWebcam,
+    stopSource,
     play,
     pause,
     seek,
     isPoseReady,
     isProcessing,
+    isRealtime,
+    isSeekable,
     error: videoError,
   } = useVideoProcessor({
     onPoseResult: (result) => {
@@ -74,6 +78,17 @@ function App() {
   const handleFileSelect = useCallback(async (file: File) => {
     await loadFile(file);
   }, [loadFile]);
+
+  const handleStartCamera = useCallback(async () => {
+    await startWebcam({ facingMode: 'user' });
+    await play();
+  }, [startWebcam, play]);
+
+  const handleStopCamera = useCallback(() => {
+    stopSource();
+    setCurrentLandmarks(null);
+    setFormResponse(null);
+  }, [stopSource]);
 
   return (
     <div className="min-h-screen bg-gray-900 text-white">
@@ -128,12 +143,16 @@ function App() {
               isPlaying={isPlaying}
               currentTime={currentTime}
               duration={duration}
+              isRealtime={isRealtime}
+              isSeekable={isSeekable}
               landmarks={currentLandmarks}
               jointColors={formResponse?.joint_colors || {}}
               onPlay={play}
               onPause={pause}
               onSeek={seek}
               onFileSelect={handleFileSelect}
+              onStartCamera={handleStartCamera}
+              onStopCamera={handleStopCamera}
             />
 
             {/* Processing status */}
@@ -165,8 +184,8 @@ function App() {
             <div className="bg-gray-800 rounded-xl p-4">
               <h3 className="text-lg font-semibold mb-3">How to Use</h3>
               <ol className="space-y-2 text-sm text-gray-400 list-decimal list-inside">
-                <li>Upload a video of yourself exercising</li>
-                <li>Press play to start analysis</li>
+                <li>Click Start Camera to open your device camera</li>
+                <li>Or upload a video and press play</li>
                 <li>The system will detect your exercise automatically</li>
                 <li>Watch for form corrections in real-time</li>
                 <li>Green skeleton = good form</li>

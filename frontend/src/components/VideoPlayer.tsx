@@ -3,7 +3,7 @@
  */
 
 import React, { useRef, useState, useEffect, useCallback } from 'react';
-import { Play, Pause, RotateCcw, Upload } from 'lucide-react';
+import { Play, Pause, RotateCcw, Upload, Camera, VideoOff } from 'lucide-react';
 import { SkeletonOverlay } from './SkeletonOverlay';
 import { PoseLandmark } from '../pose';
 
@@ -12,12 +12,16 @@ export interface VideoPlayerProps {
   isPlaying: boolean;
   currentTime: number;
   duration: number;
+  isRealtime: boolean;
+  isSeekable: boolean;
   landmarks: PoseLandmark[] | null;
   jointColors?: Record<string, string>;
   onPlay: () => void;
   onPause: () => void;
   onSeek: (time: number) => void;
   onFileSelect: (file: File) => void;
+  onStartCamera: () => void;
+  onStopCamera: () => void;
   className?: string;
 }
 
@@ -26,12 +30,16 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   isPlaying,
   currentTime,
   duration,
+  isRealtime,
+  isSeekable,
   landmarks,
   jointColors = {},
   onPlay,
   onPause,
   onSeek,
   onFileSelect,
+  onStartCamera,
+  onStopCamera,
   className = '',
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -116,15 +124,23 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         {!videoElement ? (
           // Upload placeholder
           <div className="absolute inset-0 flex flex-col items-center justify-center text-gray-400">
-            <Upload className="w-16 h-16 mb-4" />
-            <p className="text-lg font-medium">Drop a video file here</p>
-            <p className="text-sm mt-1">or click to browse</p>
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              className="mt-4 px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors"
-            >
-              Select Video
-            </button>
+            <Camera className="w-16 h-16 mb-4" />
+            <p className="text-lg font-medium">Use your camera or upload a video</p>
+            <p className="text-sm mt-1">Real-time detection runs in your browser</p>
+            <div className="mt-5 flex flex-wrap items-center justify-center gap-3">
+              <button
+                onClick={onStartCamera}
+                className="px-6 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg transition-colors"
+              >
+                Start Camera
+              </button>
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                className="px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors"
+              >
+                Select Video
+              </button>
+            </div>
           </div>
         ) : (
           <>
@@ -145,39 +161,43 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       {/* Controls */}
       {videoElement && (
         <div className="mt-4 bg-gray-800 rounded-xl p-4">
-          {/* Progress bar */}
-          <div className="flex items-center gap-3 mb-3">
-            <span className="text-sm text-gray-400 font-mono w-12">
-              {formatTime(currentTime)}
-            </span>
-            <input
-              type="range"
-              min={0}
-              max={duration || 100}
-              value={currentTime}
-              onChange={handleSeekChange}
-              className="flex-1 h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer
-                         [&::-webkit-slider-thumb]:appearance-none
-                         [&::-webkit-slider-thumb]:w-4
-                         [&::-webkit-slider-thumb]:h-4
-                         [&::-webkit-slider-thumb]:bg-blue-500
-                         [&::-webkit-slider-thumb]:rounded-full
-                         [&::-webkit-slider-thumb]:cursor-pointer"
-            />
-            <span className="text-sm text-gray-400 font-mono w-12">
-              {formatTime(duration)}
-            </span>
-          </div>
+          {/* Progress bar (file sources only) */}
+          {isSeekable && (
+            <div className="flex items-center gap-3 mb-3">
+              <span className="text-sm text-gray-400 font-mono w-12">
+                {formatTime(currentTime)}
+              </span>
+              <input
+                type="range"
+                min={0}
+                max={duration || 100}
+                value={currentTime}
+                onChange={handleSeekChange}
+                className="flex-1 h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer
+                           [&::-webkit-slider-thumb]:appearance-none
+                           [&::-webkit-slider-thumb]:w-4
+                           [&::-webkit-slider-thumb]:h-4
+                           [&::-webkit-slider-thumb]:bg-blue-500
+                           [&::-webkit-slider-thumb]:rounded-full
+                           [&::-webkit-slider-thumb]:cursor-pointer"
+              />
+              <span className="text-sm text-gray-400 font-mono w-12">
+                {formatTime(duration)}
+              </span>
+            </div>
+          )}
 
           {/* Buttons */}
-          <div className="flex items-center justify-center gap-4">
-            <button
-              onClick={() => onSeek(0)}
-              className="p-2 text-gray-400 hover:text-white transition-colors"
-              title="Restart"
-            >
-              <RotateCcw className="w-5 h-5" />
-            </button>
+          <div className="flex flex-wrap items-center justify-center gap-4">
+            {isSeekable && (
+              <button
+                onClick={() => onSeek(0)}
+                className="p-2 text-gray-400 hover:text-white transition-colors"
+                title="Restart"
+              >
+                <RotateCcw className="w-5 h-5" />
+              </button>
+            )}
 
             <button
               onClick={isPlaying ? onPause : onPlay}
@@ -190,13 +210,32 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
               )}
             </button>
 
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              className="p-2 text-gray-400 hover:text-white transition-colors"
-              title="Load new video"
-            >
-              <Upload className="w-5 h-5" />
-            </button>
+            {isRealtime ? (
+              <button
+                onClick={onStopCamera}
+                className="p-2 text-gray-400 hover:text-white transition-colors"
+                title="Stop camera"
+              >
+                <VideoOff className="w-5 h-5" />
+              </button>
+            ) : (
+              <>
+                <button
+                  onClick={onStartCamera}
+                  className="p-2 text-gray-400 hover:text-white transition-colors"
+                  title="Start camera"
+                >
+                  <Camera className="w-5 h-5" />
+                </button>
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  className="p-2 text-gray-400 hover:text-white transition-colors"
+                  title="Load new video"
+                >
+                  <Upload className="w-5 h-5" />
+                </button>
+              </>
+            )}
           </div>
         </div>
       )}

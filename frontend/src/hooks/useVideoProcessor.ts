@@ -5,6 +5,7 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { VideoSource } from '../video';
 import { FileVideoSource } from '../video/FileVideoSource';
+import { WebcamSource, WebcamConfig } from '../video/WebcamSource';
 import { PoseDetector, PoseResult, MotionBuffer } from '../pose';
 
 export interface UseVideoProcessorOptions {
@@ -21,10 +22,14 @@ export interface UseVideoProcessorReturn {
   isPlaying: boolean;
   duration: number;
   currentTime: number;
+  isRealtime: boolean;
+  isSeekable: boolean;
   
   // Controls
   loadFile: (file: File) => Promise<void>;
   loadUrl: (url: string) => Promise<void>;
+  startWebcam: (config?: WebcamConfig) => Promise<void>;
+  stopSource: () => void;
   play: () => Promise<void>;
   pause: () => void;
   seek: (time: number) => void;
@@ -56,6 +61,8 @@ export function useVideoProcessor(options: UseVideoProcessorOptions = {}): UseVi
   const [isPlaying, setIsPlaying] = useState(false);
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
+  const [isRealtime, setIsRealtime] = useState(false);
+  const [isSeekable, setIsSeekable] = useState(false);
 
   // Pose state
   const [isPoseReady, setIsPoseReady] = useState(false);
@@ -145,56 +152,74 @@ export function useVideoProcessor(options: UseVideoProcessorOptions = {}): UseVi
     };
   }, [videoElement]);
 
+  const initializeSource = useCallback(async (source: VideoSource) => {
+    setError(null);
+    setIsVideoReady(false);
+    stopProcessingInternal();
+
+    // Clean up previous source
+    if (videoSourceRef.current) {
+      videoSourceRef.current.stop();
+    }
+
+    videoSourceRef.current = source;
+
+    const element = await source.initialize();
+    const meta = source.getMetadata();
+
+    setVideoElement(element);
+    setDuration(Number.isFinite(meta.duration) ? meta.duration : 0);
+    setIsRealtime(meta.isRealtime);
+    setIsSeekable(source.isSeekable);
+    setIsVideoReady(true);
+    setCurrentTime(0);
+    motionBufferRef.current.clear();
+  }, [stopProcessingInternal]);
+
   const loadFile = useCallback(async (file: File) => {
     try {
-      setError(null);
-      setIsVideoReady(false);
-      stopProcessingInternal();
-
-      // Clean up previous source
-      if (videoSourceRef.current) {
-        videoSourceRef.current.stop();
-      }
-
-      const source = FileVideoSource.fromFile(file);
-      videoSourceRef.current = source;
-
-      const element = await source.initialize();
-      setVideoElement(element);
-      setDuration(element.duration);
-      setIsVideoReady(true);
-      motionBufferRef.current.clear();
+      await initializeSource(FileVideoSource.fromFile(file));
     } catch (e) {
       const err = e instanceof Error ? e : new Error('Failed to load video');
       setError(err);
       callbacksRef.current.onError?.(err);
     }
-  }, []);
+  }, [initializeSource]);
 
   const loadUrl = useCallback(async (url: string) => {
     try {
-      setError(null);
-      setIsVideoReady(false);
-      stopProcessingInternal();
-
-      if (videoSourceRef.current) {
-        videoSourceRef.current.stop();
-      }
-
-      const source = FileVideoSource.fromUrl(url);
-      videoSourceRef.current = source;
-
-      const element = await source.initialize();
-      setVideoElement(element);
-      setDuration(element.duration);
-      setIsVideoReady(true);
-      motionBufferRef.current.clear();
+      await initializeSource(FileVideoSource.fromUrl(url));
     } catch (e) {
       const err = e instanceof Error ? e : new Error('Failed to load video');
       setError(err);
       callbacksRef.current.onError?.(err);
     }
-  }, []);
+  }, [initializeSource]);
+
+  const startWebcam = useCallback(async (config?: WebcamConfig) => {
+    try {
+      await initializeSource(new WebcamSource(config));
+    } catch (e) {
+      const err = e instanceof Error ? e : new Error('Failed to start webcam');
+      setError(err);
+      callbacksRef.current.onError?.(err);
+    }
+  }, [initializeSource]);
+
+  const stopSource = useCallback(() => {
+    stopProcessingInternal();
+    if (videoSourceRef.current) {
+      videoSourceRef.current.stop();
+      videoSourceRef.current = null;
+    }
+    setVideoElement(null);
+    setIsVideoReady(false);
+    setIsPlaying(false);
+    setDuration(0);
+    setCurrentTime(0);
+    setIsRealtime(false);
+    setIsSeekable(false);
+  }, [stopProcessingInternal]);
 
   const play = useCallback(async () => {
     if (videoSourceRef.current) {
@@ -299,8 +324,12 @@ export function useVideoProcessor(options: UseVideoProcessorOptions = {}): UseVi
     isPlaying,
     duration,
     currentTime,
+    isRealtime,
+    isSeekable,
     loadFile,
     loadUrl,
+    startWebcam,
+    stopSource,
     play,
     pause,
     seek,
