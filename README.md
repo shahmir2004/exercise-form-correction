@@ -25,6 +25,7 @@ This application uses **MediaPipe Pose Landmarker** to detect human body poses i
 - **📐 3D Feature Extraction** — Hip-relative, torso-normalized joint coordinates; view estimation (frontal/profile/three-quarter)
 - **🔌 WebSocket Streaming** — Low-latency real-time communication with 60 fps rate limiting
 - **📹 Video Upload** — Analyze pre-recorded workout videos
+- **📷 Live Camera Mode** — Standalone frontend supports real-time webcam analysis
 
 ---
 
