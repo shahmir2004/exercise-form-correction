@@ -107,13 +107,16 @@ class FormEvaluator:
         right_knee = angles.get("right_knee", 180.0)
         torso = angles.get("torso_angle", 0.0)
 
-        # Knee valgus: knee X closer to midline than ankle X
+        # Knee valgus: knee X closer to midline than ankle X.
+        # In hip-relative TORSO-NORMALIZED coords (1 unit = 1 torso length),
+        # a real knee cave-in measures ~0.10–0.15 torso units; 0.05 was tuned
+        # for raw image-space coords and fired on every squat.
         lk = coords[25]; la = coords[27]  # left knee, left ankle (hip-relative)
         rk = coords[26]; ra = coords[28]  # right knee, right ankle
-        # In hip-relative coords, left side is negative x, right positive x
-        # Valgus: knee drifts toward center relative to ankle
-        left_valgus = bool((lk[0] - la[0]) > 0.05)
-        right_valgus = bool((ra[0] - rk[0]) > 0.05)
+        # Left side has negative x, right side positive x (MediaPipe convention).
+        # Valgus: knee drifts toward center (x closer to 0) relative to ankle.
+        left_valgus = bool((lk[0] - la[0]) > 0.12)
+        right_valgus = bool((ra[0] - rk[0]) > 0.12)
 
         if left_valgus:
             violations.append(Violation(
@@ -162,25 +165,39 @@ class FormEvaluator:
         coords = frame.coords
         angles = frame.angles
 
-        # Hip sag / pike — compare hip Y to shoulder-ankle midpoint
-        # In hip-relative normalized coords: hip origin ≈ 0
-        # shoulder is near top (negative y), ankle near bottom (positive y)
-        ls_y = float(coords[11][1]); rs_y = float(coords[12][1])
-        la_y = float(coords[27][1]); ra_y = float(coords[28][1])
-        mid_shoulder_y = (ls_y + rs_y) / 2.0
-        mid_ankle_y = (la_y + ra_y) / 2.0
-        expected_hip_y = (mid_shoulder_y + mid_ankle_y) / 2.0
-        # hip_y in hip-relative coords ≈ 0 by definition; deviation from 0 is the sag
-        actual_hip_y = 0.0  # origin
-        sag = actual_hip_y - expected_hip_y
-        if sag > 0.1:
+        # Hip sag / pike — measure perpendicular deviation of hips from the
+        # line connecting mean-shoulder to mean-ankle.
+        # In hip-relative torso-normalized coords:
+        #   hip origin ≈ (0, 0, 0) by definition (mean of L/R hip = origin)
+        #   in a perfect horizontal plank the line shoulder→ankle passes
+        #   through the hip origin → perpendicular distance ≈ 0.
+        # A sagging plank: hips drop below the line → larger perpendicular
+        # distance in the +y direction. A piked plank: hips rise above → -y.
+        ls = coords[11]; rs = coords[12]
+        la = coords[27]; ra = coords[28]
+        shoulder_mid = (ls + rs) / 2.0
+        ankle_mid = (la + ra) / 2.0
+        body_vec = ankle_mid - shoulder_mid
+        body_len = float(np.linalg.norm(body_vec))
+        if body_len < 1e-6:
+            return violations  # body too compressed to evaluate
+        # Project hip origin (0,0,0) onto shoulder→ankle line, then take
+        # the residual perpendicular component. The y-sign of that residual
+        # tells sag (positive y in MediaPipe = lower in frame = sagging).
+        hip_to_shoulder = -shoulder_mid  # vector from shoulder to hip-origin
+        t = float(np.dot(hip_to_shoulder, body_vec) / (body_len * body_len))
+        closest_pt = shoulder_mid + t * body_vec
+        residual = -closest_pt   # vector from line to hip origin
+        sag = float(residual[1])  # +y = sagging (hips below line)
+
+        if sag > 0.15:
             violations.append(Violation(
                 code="hip_sag", severity="red",
                 joints=["left_hip", "right_hip"],
                 message="Hips sagging",
                 correction="Engage your core and lift your hips in line with shoulders"
             ))
-        elif sag < -0.1:
+        elif sag < -0.15:
             violations.append(Violation(
                 code="hip_pike", severity="yellow",
                 joints=["left_hip", "right_hip"],
@@ -227,12 +244,15 @@ class FormEvaluator:
         left_elbow = angles.get("left_elbow", 180.0)
         right_elbow = angles.get("right_elbow", 180.0)
 
-        # Elbow drift: elbow X far from shoulder X
-        # In hip-relative coords
+        # Elbow drift: elbow X far from shoulder X (forward-flare on a curl).
+        # In torso-normalized hip-relative coords, an elbow pinned to the
+        # side stays within ~0.15 torso of the shoulder x; a real drift is
+        # ~0.25+. The 0.12 threshold tuned for raw image-space was firing
+        # on every curl rep.
         le = coords[13]; ls = coords[11]  # left elbow, left shoulder
         re = coords[14]; rs = coords[12]  # right elbow, right shoulder
-        left_drift = bool(abs(float(le[0]) - float(ls[0])) > 0.12)
-        right_drift = bool(abs(float(re[0]) - float(rs[0])) > 0.12)
+        left_drift = bool(abs(float(le[0]) - float(ls[0])) > 0.25)
+        right_drift = bool(abs(float(re[0]) - float(rs[0])) > 0.25)
 
         if left_drift:
             violations.append(Violation(

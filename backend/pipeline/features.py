@@ -46,6 +46,13 @@ class BodyFrame:
     hip_y: float = 0.5
     # Shoulder Y position (normalized)
     shoulder_y: float = 0.3
+    # Sign-product of left/right elbow angle deltas across recent frames.
+    # +1 = both arms moving in the same direction (standard curl).
+    # -1 = arms moving in opposite directions (alternate curl).
+    #  0 = arms not moving (squat/pushup/idle).
+    # Survives the symmetric-crossover frame in alt-curls because the
+    # *velocities* keep their opposite signs even when the *positions* coincide.
+    arm_phase_diff: float = 0.0
 
 
 def calculate_angle(p1: np.ndarray, p2: np.ndarray, p3: np.ndarray) -> float:
@@ -97,6 +104,53 @@ def _estimate_view(xyz: np.ndarray) -> ViewEstimate:
 
 class FeatureExtractor:
     """Converts smoothed Kalman output into BodyFrame features."""
+
+    # EMA decay for elbow-angle velocity used in arm_phase_diff.
+    # 0.7 keeps a couple-frame memory; small enough that the velocity sign
+    # flips quickly when an arm reverses direction at the top/bottom of a curl.
+    _VELOCITY_EMA_DECAY = 0.7
+    # Minimum |velocity| (degrees/frame) to count as "actively moving".
+    # Below this, the arm is treated as stationary and contributes 0 to phase_diff.
+    _MIN_VELOCITY_DEG = 0.4
+
+    def __init__(self) -> None:
+        self._prev_left_elbow: Optional[float] = None
+        self._prev_right_elbow: Optional[float] = None
+        self._left_velocity_ema: float = 0.0
+        self._right_velocity_ema: float = 0.0
+
+    def reset(self) -> None:
+        self._prev_left_elbow = None
+        self._prev_right_elbow = None
+        self._left_velocity_ema = 0.0
+        self._right_velocity_ema = 0.0
+
+    def _update_arm_phase_diff(self, left_elbow: float, right_elbow: float) -> float:
+        """
+        Track EMA of left/right elbow angle velocities and return their
+        sign-product. +1 when both elbows flex/extend together (standard curl),
+        -1 when they move in opposite directions (alternate curl), 0 when
+        either is below the motion threshold.
+        """
+        if self._prev_left_elbow is None or self._prev_right_elbow is None:
+            self._prev_left_elbow = left_elbow
+            self._prev_right_elbow = right_elbow
+            return 0.0
+
+        d_left = left_elbow - self._prev_left_elbow
+        d_right = right_elbow - self._prev_right_elbow
+        self._prev_left_elbow = left_elbow
+        self._prev_right_elbow = right_elbow
+
+        a = self._VELOCITY_EMA_DECAY
+        self._left_velocity_ema = a * self._left_velocity_ema + (1.0 - a) * d_left
+        self._right_velocity_ema = a * self._right_velocity_ema + (1.0 - a) * d_right
+
+        if (abs(self._left_velocity_ema) < self._MIN_VELOCITY_DEG or
+                abs(self._right_velocity_ema) < self._MIN_VELOCITY_DEG):
+            return 0.0
+
+        return float(np.sign(self._left_velocity_ema) * np.sign(self._right_velocity_ema))
 
     def extract(self, smoothed_xyz: np.ndarray, uncertainty: np.ndarray,
                 original_vis: np.ndarray) -> BodyFrame:
@@ -161,6 +215,10 @@ class FeatureExtractor:
         hip_y = float(hip_origin[1])
         shoulder_y = float(shoulder_mid[1])
 
+        arm_phase_diff = self._update_arm_phase_diff(
+            angles["left_elbow"], angles["right_elbow"]
+        )
+
         return BodyFrame(
             coords=coords,
             angles=angles,
@@ -170,4 +228,5 @@ class FeatureExtractor:
             is_horizontal=is_horizontal,
             hip_y=hip_y,
             shoulder_y=shoulder_y,
+            arm_phase_diff=arm_phase_diff,
         )

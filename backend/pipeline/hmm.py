@@ -64,18 +64,28 @@ def _build_transition_matrix(cfg: HMMConfig) -> np.ndarray:
     return A
 
 
-def _extract_obs_features(frame: BodyFrame) -> np.ndarray:
+N_FEATURES = 8
+
+
+def _extract_obs_features(frame: BodyFrame, arm_asym_ema: float, elbow_flex_ema: float) -> np.ndarray:
     """
-    Extract 7 observation features from BodyFrame.
+    Extract 8 observation features from BodyFrame.
 
     Features:
     0 - body_horizontal: body roughly horizontal (push-up)
     1 - knee_bent_no_curl: knees bent AND arms straight (pure squat signal)
     2 - elbow_flexion_active: min elbow angle <140 (arms bent)
-    3 - hip_y_low_standing: hips low in frame AND knees relatively straight
-    4 - arm_asymmetry: abs(left_elbow - right_elbow) normalized (alt curl)
+    3 - hip_y_low: hips low in frame (squat regardless of knee angle)
+    4 - arm_asymmetry_ema: EMA-smoothed |L_elbow - R_elbow| normalized.
+        EMA survives the symmetric mid-rep frame in alt-curls where the
+        instantaneous asymmetry collapses to zero.
     5 - vertical_stance: torso angle <30 from vertical
     6 - elbow_curl_no_knees: elbow flexion WITHOUT knee flexion (standing curl)
+    7 - arm_phase_diff: signed product of L/R elbow velocities. +1 = both
+        flexing/extending together (standard curl), -1 = opposite directions
+        (alt curl), 0 = arms still (squat/pushup/idle). This signal does NOT
+        vanish at mid-rep crossover — the velocities keep their opposite
+        signs throughout.
     """
     angles = frame.angles
     left_knee = angles.get("left_knee", 180.0)
@@ -96,40 +106,48 @@ def _extract_obs_features(frame: BodyFrame) -> np.ndarray:
     # Standing curl: elbow bent, knees straight
     elbow_curl_no_knees = 1.0 if (elbow_bent and not knee_bent) else 0.0
 
-    # Hip low only meaningful for squats (standing, knees somewhat straight)
-    hip_y_low_standing = 1.0 if (frame.hip_y > 0.55 and min_knee > 120.0) else 0.0
+    # Hip low: hips in lower half of frame. Used to be ANDed with min_knee>120
+    # which made it false during the actual squat motion (knees at 70-110)
+    # — that bug penalized real squats. Drop the AND.
+    hip_y_low = 1.0 if frame.hip_y > 0.55 else 0.0
 
     obs = np.array([
         1.0 if frame.is_horizontal else 0.0,
         knee_bent_no_curl,
-        1.0 if elbow_bent else 0.0,
-        hip_y_low_standing,
-        min(1.0, abs(left_elbow - right_elbow) / 40.0),
+        elbow_flex_ema,                          # smoothed; survives mid-rep extension
+        hip_y_low,
+        arm_asym_ema,
         1.0 if torso < 30.0 else 0.0,
         elbow_curl_no_knees,
+        frame.arm_phase_diff,
     ], dtype=np.float64)
     return obs
 
 
 # Emission probabilities: Gaussian means per state per feature
-# Shape: (N_STATES, 7)
-# Features: body_horiz | knee_bent_no_curl | elbow_flex | hip_low_standing | arm_asym | vert_stance | elbow_no_knees
+# Shape: (N_STATES, 8)
+# Features: body_horiz | knee_bent_no_curl | elbow_flex | hip_low | arm_asym | vert_stance | elbow_no_knees | phase_diff
 _EMISSION_MEANS = np.array([
-    # horiz  kn_no_curl  elbow  hip_low  asym  vert  elbow_no_kn
-    [0.0,    0.0,        0.0,   0.0,     0.0,  0.5,  0.0],   # IDLE
-    [0.0,    0.95,       0.0,   0.7,     0.0,  0.8,  0.0],   # SQUAT
-    [0.95,   0.0,        0.85,  0.4,     0.0,  0.1,  0.0],   # PUSHUP
-    [0.0,    0.0,        0.9,   0.0,     0.1,  0.9,  0.5],   # CURL (standing or seated — elbow_no_knees is don't-care)
-    [0.0,    0.0,        0.85,  0.0,     0.75, 0.9,  0.5],   # ALT_CURL (may be seated so elbow_no_knees can be 0)
+    # horiz  kn_no_curl  elbow  hip_low  asym  vert  elbow_no_kn  phase
+    [0.0,    0.0,        0.0,   0.0,     0.0,  0.5,  0.0,         0.0],   # IDLE
+    [0.0,    0.95,       0.0,   0.85,    0.0,  0.6,  0.0,         0.0],   # SQUAT  (hip_low up to 0.85; vert relaxed: torso leans forward)
+    [0.95,   0.0,        0.85,  0.4,     0.0,  0.1,  0.0,         0.0],   # PUSHUP
+    [0.0,    0.0,        0.9,   0.0,     0.1,  0.9,  0.5,         0.5],   # CURL: arms in phase
+    [0.0,    0.0,        0.85,  0.0,     0.75, 0.9,  0.5,        -0.7],   # ALT_CURL: arms anti-phase
 ], dtype=np.float64)
 
-_EMISSION_VARS = np.full((N_STATES, 7), 0.08, dtype=np.float64)
+_EMISSION_VARS = np.full((N_STATES, N_FEATURES), 0.08, dtype=np.float64)
 # Wider variance for features that are less discriminative
 _EMISSION_VARS[:, 5] = 0.15   # vert_stance — can vary
-_EMISSION_VARS[:, 4] = 0.10   # arm_asym baseline
-_EMISSION_VARS[ExState.SQUAT, 4] = 0.03    # squats: near-zero asymmetry required
-_EMISSION_VARS[ExState.PUSHUP, 4] = 0.03   # pushups: near-zero asymmetry required
-_EMISSION_VARS[ExState.ALT_CURL, 4] = 0.05 # alt curl: clear asymmetry required
+_EMISSION_VARS[:, 4] = 0.12   # arm_asym baseline (slightly wider with EMA smoothing)
+_EMISSION_VARS[ExState.SQUAT, 4] = 0.05    # squats: low asymmetry required
+_EMISSION_VARS[ExState.PUSHUP, 4] = 0.05   # pushups: low asymmetry required
+_EMISSION_VARS[ExState.ALT_CURL, 4] = 0.10 # alt curl: clear asymmetry required (wider — EMA dampens peaks)
+# elbow_flexion_active for ALT_CURL: between alternating reps the curling
+# arm is briefly nearly straight (both elbows >140°). Wider variance so
+# those transition frames don't unseat the state.
+_EMISSION_VARS[ExState.CURL, 2] = 0.15
+_EMISSION_VARS[ExState.ALT_CURL, 2] = 0.20
 # elbow_no_knees: wide variance for both CURL and ALT_CURL (both can be seated)
 _EMISSION_VARS[ExState.CURL, 6] = 0.25
 _EMISSION_VARS[ExState.ALT_CURL, 6] = 0.25
@@ -137,13 +155,36 @@ _EMISSION_VARS[ExState.ALT_CURL, 6] = 0.25
 _EMISSION_VARS[ExState.SQUAT, 1] = 0.04
 _EMISSION_VARS[ExState.CURL, 1] = 0.04
 _EMISSION_VARS[ExState.ALT_CURL, 1] = 0.04
+# phase_diff: must discriminate CURL (+1) from ALT_CURL (-1). Wider so
+# transient zero frames don't kill the state.
+_EMISSION_VARS[ExState.CURL, 7] = 0.30
+_EMISSION_VARS[ExState.ALT_CURL, 7] = 0.30
+# Other states are agnostic to phase_diff (arms still anyway) — wide variance.
+_EMISSION_VARS[ExState.IDLE, 7] = 0.5
+_EMISSION_VARS[ExState.SQUAT, 7] = 0.5
+_EMISSION_VARS[ExState.PUSHUP, 7] = 0.5
 
 
 class ExerciseHMM:
     """
     Forward-algorithm HMM for exercise classification.
-    Maintains running log-alpha (forward variable) across frames.
+    Maintains running log-alpha (forward variable) across frames, plus
+    an EMA of arm asymmetry (so the symmetric mid-rep frame in alt-curls
+    doesn't collapse the ALT_CURL likelihood).
     """
+
+    # EMA decay for arm-asymmetry feature. 0.8 = ~5-frame memory.
+    _ASYM_EMA_DECAY = 0.8
+    # EMA decay for elbow_flexion_active feature. Same span as asym.
+    # Smooths over the brief moment between alternating curls when both
+    # arms are nearly straight (elbow > 140°).
+    _ELBOW_EMA_DECAY = 0.8
+    # Threshold above which ALT_CURL gets a self-bias bonus on the next frame.
+    _ALT_CURL_HOLD_THRESHOLD = 0.4
+    # Log-emission bonus added to ALT_CURL when its previous-frame posterior
+    # exceeded the hold threshold. Equivalent to a stronger self-loop for
+    # ALT_CURL only — narrow fix, doesn't make other states stickier.
+    _ALT_CURL_HOLD_BONUS = 1.0
 
     def __init__(self, config: Optional[HMMConfig] = None):
         self.config = config or HMMConfig()
@@ -152,6 +193,9 @@ class ExerciseHMM:
         self._log_alpha = np.log(np.full(N_STATES, 1.0 / N_STATES))
         self._emission_means = _EMISSION_MEANS.copy()
         self._emission_vars = _EMISSION_VARS * self.config.obs_variance_scale
+        self._arm_asym_ema: float = 0.0
+        self._elbow_flex_ema: float = 0.0
+        self._prev_alt_curl_post: float = 0.0
 
     def _log_emission(self, state: int, obs: np.ndarray) -> float:
         """Log probability of obs given state (Gaussian)."""
@@ -159,15 +203,24 @@ class ExerciseHMM:
         var = self._emission_vars[state]
         log_p = -0.5 * np.sum((obs - mu) ** 2 / var + np.log(2 * np.pi * var))
 
-        arm_asym = float(obs[4])   # feature 4
-        elbow_flex = float(obs[2]) # feature 2
+        arm_asym = float(obs[4])    # feature 4 (EMA-smoothed)
+        elbow_flex = float(obs[2])  # feature 2
+        phase_diff = float(obs[7])  # feature 7
 
         if state == ExState.ALT_CURL:
-            # Reward asymmetry; seated alt-curls may have low asymmetry mid-rep
+            # Reward asymmetry AND anti-phase motion; either signal is enough
+            # to keep ALT_CURL alive across crossover frames.
             log_p += 4.0 * arm_asym + 1.5 * elbow_flex * arm_asym
+            log_p += 2.5 * max(0.0, -phase_diff)  # rewards phase_diff < 0
+            # Self-bias hysteresis: once ALT_CURL has been confidently detected,
+            # add a constant bonus next frame so symmetric crossover frames
+            # don't unseat it. Decays as posterior decays.
+            if self._prev_alt_curl_post > self._ALT_CURL_HOLD_THRESHOLD:
+                log_p += self._ALT_CURL_HOLD_BONUS
         elif state == ExState.CURL:
-            # Both standing and seated curls: reward elbow flexion
+            # Both standing and seated curls: reward elbow flexion + in-phase
             log_p += 2.0 * elbow_flex
+            log_p += 1.0 * max(0.0, phase_diff)   # rewards phase_diff > 0
         elif state == ExState.SQUAT:
             # Hard penalties: squats never have arm asymmetry or elbow flexion
             log_p -= 7.0 * arm_asym
@@ -183,7 +236,20 @@ class ExerciseHMM:
         Run one forward step.
         Returns posterior P(state | obs_1..t).
         """
-        obs = _extract_obs_features(frame)
+        # Update arm-asymmetry EMA. Uses raw |L-R| degrees normalized by 40.
+        left_elbow = frame.angles.get("left_elbow", 180.0)
+        right_elbow = frame.angles.get("right_elbow", 180.0)
+        instant_asym = min(1.0, abs(left_elbow - right_elbow) / 40.0)
+        a = self._ASYM_EMA_DECAY
+        self._arm_asym_ema = a * self._arm_asym_ema + (1.0 - a) * instant_asym
+
+        # Update elbow-flexion EMA. Instant signal is "min elbow < 140".
+        min_elbow = min(left_elbow, right_elbow)
+        instant_elbow_flex = 1.0 if min_elbow < 140.0 else 0.0
+        b = self._ELBOW_EMA_DECAY
+        self._elbow_flex_ema = b * self._elbow_flex_ema + (1.0 - b) * instant_elbow_flex
+
+        obs = _extract_obs_features(frame, self._arm_asym_ema, self._elbow_flex_ema)
 
         # Emission log-probabilities
         log_b = np.array([self._log_emission(s, obs) for s in range(N_STATES)])
@@ -207,6 +273,9 @@ class ExerciseHMM:
         posterior = np.clip(posterior, 0.0, 1.0)
         posterior /= posterior.sum()
 
+        # Cache ALT_CURL posterior for next-frame self-bias.
+        self._prev_alt_curl_post = float(posterior[ExState.ALT_CURL])
+
         # Most likely state
         ml_state = ExState(int(np.argmax(posterior)))
 
@@ -229,3 +298,6 @@ class ExerciseHMM:
 
     def reset(self):
         self._log_alpha = np.log(np.full(N_STATES, 1.0 / N_STATES))
+        self._arm_asym_ema = 0.0
+        self._elbow_flex_ema = 0.0
+        self._prev_alt_curl_post = 0.0

@@ -55,6 +55,11 @@ class Settings(BaseSettings):
     HMM_TRANSITION_SELF_LOOP: float = 0.95
     HMM_TRANSITION_TO_IDLE: float = 0.02
     HMM_OBSERVATION_VARIANCE_SCALE: float = 1.0
+    # Minimum HMM exercise_confidence to start running the active exercise
+    # module (rep counter + form check). Below this, the system stays in
+    # passive scanning. Lower values let reps count earlier; the rep counter's
+    # own hysteresis filters spurious frames.
+    MIN_CONFIDENCE_FOR_REPS: float = 0.4
 
     # Pipeline — ViolationAggregator
     VIOLATION_AGG_M: int = 4

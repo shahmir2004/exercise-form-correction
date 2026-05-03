@@ -150,30 +150,45 @@ class FormManager:
         if new_sys_state != self._state:
             self._state = new_sys_state
             self._state_start_time = time.time()
+            # NB: do NOT reset _active_module on IDLE transitions. A user
+            # standing tall at the top of a squat rep momentarily looks like
+            # IDLE — wiping the rep counter there resets the count every rep.
+            # The module persists; only the FormEvaluator history (which is
+            # exercise-specific stable violations) needs clearing on idle.
             if new_sys_state == SystemState.IDLE:
-                self._current_exercise = None
-                self._active_module = None
-                self._last_result = None
                 self._form_evaluator.reset()
 
-        # 6. Map HMM to exercise type + activate module
+        # 6. Map HMM to exercise type + activate module.
+        # Two cases:
+        #   (a) HMM is confident enough → (re)activate the matching module.
+        #   (b) HMM lost confidence (e.g. user momentarily standing tall at
+        #       the top of a rep) but a module is already active → keep
+        #       running it so the rep counter sees the angle returning to
+        #       extension. Letting the HMM gate every frame's rep update
+        #       resets reps mid-set.
         detected_ex = _EX_STATE_TO_TYPE.get(hmm_result.most_likely_state)
-        if new_sys_state == SystemState.ACTIVE and detected_ex is not None:
+        if (
+            detected_ex is not None
+            and ex_conf >= settings.MIN_CONFIDENCE_FOR_REPS
+            and new_sys_state != SystemState.IDLE
+        ):
             if detected_ex != self._current_exercise:
                 self._activate_module(detected_ex)
-            # Run exercise module for rep counting
-            if self._active_module:
-                self._last_result = self._active_module.process_frame(landmarks)
+
+        if self._active_module is not None:
+            self._last_result = self._active_module.process_frame(landmarks)
 
         # 7. Form evaluation (pipeline-based, temporally stable)
         ex_name = _EX_TYPE_TO_NAME.get(self._current_exercise)
         stable_violations = self._form_evaluator.evaluate(frame, ex_name)
 
-        # Override violations in exercise result with stable ones
+        # Overlay stable violations on the module's result. We only mutate
+        # violation/correction/joint_color fields — rep_phase, rep_count,
+        # is_valid, and angles are owned by the exercise module and must
+        # not be overwritten here.
         if self._last_result is not None and stable_violations is not None:
             self._last_result.violations = [v.message for v in stable_violations]
             self._last_result.corrections = [v.correction for v in stable_violations if v.correction]
-            # Update joint colors from violation severity
             for v in stable_violations:
                 for joint in v.joints:
                     self._last_result.joint_colors[joint] = v.severity
@@ -252,6 +267,7 @@ class FormManager:
         self._last_frame_time = None
         self._validator.reset()
         self._kalman.reset()
+        self._feature_extractor.reset()
         self._hmm.reset()
         self._form_evaluator.reset()
 
