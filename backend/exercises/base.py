@@ -275,8 +275,10 @@ class BaseExercise(ABC):
         # Convert to landmark dictionary
         landmark_dict = landmarks_to_dict(landmarks)
         
-        # Check if required joints are visible
-        visibility_threshold = 0.5
+        # Check if required joints are visible.
+        # Lower threshold (0.3) to accommodate seated positions where lower-body
+        # landmarks (knees, hips) may have reduced visibility confidence.
+        visibility_threshold = 0.3
         for joint in self.required_joints:
             if joint not in landmark_dict:
                 return ExerciseResult(
