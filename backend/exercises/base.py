@@ -295,15 +295,9 @@ class BaseExercise(ABC):
                     corrections=["Adjust camera angle or lighting"]
                 )
         
-        # Detect rep phase
+        # Detect rep phase (may update self.rep_count internally via _rep_counter)
         current_phase = self.detect_rep_phase(landmark_dict)
-        
-        # Count reps on phase transitions
-        if self._phase_history:
-            last_phase = self._phase_history[-1]
-            if self._is_rep_complete(last_phase, current_phase):
-                self.rep_count += 1
-        
+
         self._phase_history.append(current_phase)
         if len(self._phase_history) > 30:
             self._phase_history.pop(0)

@@ -83,11 +83,17 @@ def _extract_obs_features(frame: BodyFrame) -> np.ndarray:
     right_elbow = angles.get("right_elbow", 180.0)
     torso = angles.get("torso_angle", 0.0)
 
+    # hip_y_low: only treat as squat signal when hips are low AND knees are
+    # relatively straight (>110°). When seated, knees are ~90° so this fires
+    # correctly for squats but not for seated curls.
+    min_knee = min(left_knee, right_knee)
+    hip_y_low_squat = 1.0 if (frame.hip_y > 0.55 and min_knee > 110.0) else 0.0
+
     obs = np.array([
         1.0 if frame.is_horizontal else 0.0,
-        1.0 if min(left_knee, right_knee) < 140.0 else 0.0,
+        1.0 if min_knee < 140.0 else 0.0,
         1.0 if min(left_elbow, right_elbow) < 140.0 else 0.0,
-        1.0 if frame.hip_y > 0.55 else 0.0,   # hips lower in frame = higher y value
+        hip_y_low_squat,
         min(1.0, abs(left_elbow - right_elbow) / 40.0),
         1.0 if torso < 30.0 else 0.0,
     ], dtype=np.float64)
@@ -99,18 +105,20 @@ def _extract_obs_features(frame: BodyFrame) -> np.ndarray:
 _EMISSION_MEANS = np.array([
     # body_horiz  knee_flex  elbow_flex  hip_low  arm_asym  vert_stance
     [0.0,         0.0,       0.0,        0.0,     0.0,      0.5],   # IDLE
-    [0.0,         0.9,       0.0,        0.7,     0.1,      0.8],   # SQUAT
-    [0.95,        0.1,       0.8,        0.5,     0.1,      0.1],   # PUSHUP
+    [0.0,         0.9,       0.0,        0.7,     0.0,      0.8],   # SQUAT  (arm_asym expected ~0)
+    [0.95,        0.1,       0.8,        0.5,     0.0,      0.1],   # PUSHUP (arm_asym expected ~0)
     [0.0,         0.0,       0.9,        0.0,     0.1,      0.9],   # CURL
     # Alternate curls are identified primarily by arm asymmetry; a strong
     # asymmetry boost is applied in _log_emission so seated curls do not fall
     # back to the squat state.
-    [0.0,         0.0,       0.85,       0.0,     0.7,      0.9],   # ALT_CURL
+    [0.0,         0.0,       0.85,       0.0,     0.75,     0.9],   # ALT_CURL
 ], dtype=np.float64)
 
-_EMISSION_VARS = np.full((N_STATES, 6), 0.12, dtype=np.float64)
-_EMISSION_VARS[:, 4] = 0.20  # arm asymmetry has higher variance
-_EMISSION_VARS[ExState.ALT_CURL, 4] = 0.08  # alternate curls should have clear asymmetry
+_EMISSION_VARS = np.full((N_STATES, 6), 0.10, dtype=np.float64)
+_EMISSION_VARS[:, 4] = 0.15   # arm asymmetry — tighter variance overall
+_EMISSION_VARS[ExState.SQUAT, 4] = 0.04   # squats must have near-zero asymmetry
+_EMISSION_VARS[ExState.PUSHUP, 4] = 0.04  # pushups must have near-zero asymmetry
+_EMISSION_VARS[ExState.ALT_CURL, 4] = 0.06  # alternate curls must have clear asymmetry
 
 
 class ExerciseHMM:
@@ -133,14 +141,21 @@ class ExerciseHMM:
         var = self._emission_vars[state]
         log_p = -0.5 * np.sum((obs - mu) ** 2 / var + np.log(2 * np.pi * var))
 
-        # Arm asymmetry is the key cue for alternate curls and a strong
-        # negative cue for squats. This keeps seated alternating curls from
-        # collapsing into the squat state while preserving regular curl scores.
+        # Arm asymmetry is the key cue for alternate curls and a hard
+        # negative cue for squats/pushups (which never have arm asymmetry).
+        # Elbow flexion present alongside arm asymmetry strongly suggests
+        # an alternate curl, not a squat, even when seated (knees bent).
         arm_asym = float(obs[4])
+        elbow_flex = float(obs[2])
         if state == ExState.ALT_CURL:
-            log_p += 3.5 * arm_asym
+            # Strong reward: asymmetry + elbow flexion together
+            log_p += 4.0 * arm_asym + 1.5 * elbow_flex * arm_asym
         elif state == ExState.SQUAT:
-            log_p -= 4.5 * arm_asym
+            # Hard penalty: squats never have arm asymmetry
+            log_p -= 6.0 * arm_asym
+        elif state == ExState.PUSHUP:
+            # Hard penalty: pushups never have arm asymmetry
+            log_p -= 5.0 * arm_asym
 
         return float(log_p)
 

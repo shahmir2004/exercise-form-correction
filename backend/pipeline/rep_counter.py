@@ -95,9 +95,10 @@ class HysteresisRepCounter:
         rep_completed = False
 
         if self._phase == RepPhase.IDLE:
-            if angle > self.upper_threshold - 10:
-                self._phase = RepPhase.READY
-                self._rep_start_time = current_time
+            # Accept any starting position to avoid getting stuck when the
+            # person begins mid-rep or at a non-extended angle.
+            self._phase = RepPhase.READY
+            self._rep_start_time = current_time
 
         elif self._phase == RepPhase.READY:
             if angle < self.upper_threshold:
