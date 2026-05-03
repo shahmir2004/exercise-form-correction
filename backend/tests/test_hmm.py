@@ -60,6 +60,20 @@ def _make_curl_frame() -> BodyFrame:
     )
 
 
+def _make_seated_alt_curl_frame() -> BodyFrame:
+    return BodyFrame(
+        coords=np.zeros((33, 3)),
+        angles={"left_knee": 88.0, "right_knee": 92.0,
+                "left_elbow": 72.0, "right_elbow": 138.0,
+                "torso_angle": 10.0},
+        uncertainty=np.zeros(33),
+        view_estimate=ViewEstimate.FRONTAL,
+        is_horizontal=False,
+        hip_y=0.7,
+        shoulder_y=0.35,
+    )
+
+
 def test_hmm_returns_result():
     hmm = ExerciseHMM()
     frame = _make_idle_frame()
@@ -97,6 +111,17 @@ def test_curl_sequence_converges():
         result = hmm.update(_make_curl_frame())
     assert result.most_likely_state == ExState.CURL, \
         f"Expected CURL, got {result.state_name}"
+
+
+def test_seated_alternate_curl_does_not_collapse_to_squat():
+    """Seated alternate curls should classify as ALT_CURL, not SQUAT."""
+    hmm = ExerciseHMM()
+    result = None
+    for _ in range(40):
+        result = hmm.update(_make_seated_alt_curl_frame())
+    assert result.most_likely_state == ExState.ALT_CURL, \
+        f"Expected ALT_CURL, got {result.state_name} conf={result.exercise_confidence:.3f}"
+    assert result.posterior[ExState.ALT_CURL] > result.posterior[ExState.SQUAT]
 
 
 def test_smooth_transition_no_flicker():

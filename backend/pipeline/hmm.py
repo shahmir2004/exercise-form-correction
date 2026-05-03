@@ -102,11 +102,15 @@ _EMISSION_MEANS = np.array([
     [0.0,         0.9,       0.0,        0.7,     0.1,      0.8],   # SQUAT
     [0.95,        0.1,       0.8,        0.5,     0.1,      0.1],   # PUSHUP
     [0.0,         0.0,       0.9,        0.0,     0.1,      0.9],   # CURL
-    [0.0,         0.0,       0.8,        0.0,     0.7,      0.9],   # ALT_CURL
+    # Alternate curls are identified primarily by arm asymmetry; a strong
+    # asymmetry boost is applied in _log_emission so seated curls do not fall
+    # back to the squat state.
+    [0.0,         0.0,       0.85,       0.0,     0.7,      0.9],   # ALT_CURL
 ], dtype=np.float64)
 
 _EMISSION_VARS = np.full((N_STATES, 6), 0.12, dtype=np.float64)
 _EMISSION_VARS[:, 4] = 0.20  # arm asymmetry has higher variance
+_EMISSION_VARS[ExState.ALT_CURL, 4] = 0.08  # alternate curls should have clear asymmetry
 
 
 class ExerciseHMM:
@@ -128,6 +132,16 @@ class ExerciseHMM:
         mu = self._emission_means[state]
         var = self._emission_vars[state]
         log_p = -0.5 * np.sum((obs - mu) ** 2 / var + np.log(2 * np.pi * var))
+
+        # Arm asymmetry is the key cue for alternate curls and a strong
+        # negative cue for squats. This keeps seated alternating curls from
+        # collapsing into the squat state while preserving regular curl scores.
+        arm_asym = float(obs[4])
+        if state == ExState.ALT_CURL:
+            log_p += 3.5 * arm_asym
+        elif state == ExState.SQUAT:
+            log_p -= 4.5 * arm_asym
+
         return float(log_p)
 
     def update(self, frame: BodyFrame) -> HMMResult:
