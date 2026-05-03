@@ -2,27 +2,22 @@
 
 import json
 import asyncio
+import time
 from typing import Optional
-from dataclasses import asdict
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from state_machine.manager import FormManager, SystemState
 from exercises.classifier import ExerciseType
+from pipeline.validator import InputValidator, ValidationError
 
 
 router = APIRouter()
 
 
-class LandmarkData(BaseModel):
-    """Incoming landmark data from client."""
-    landmarks: list[dict]
-    timestamp: float
-
-
 class FormCorrectionResponse(BaseModel):
-    """Response sent back to client."""
+    """Response sent back to client — backwards compatible + new fields."""
     state: str
     current_exercise: Optional[str]
     exercise_display: str
@@ -33,70 +28,83 @@ class FormCorrectionResponse(BaseModel):
     corrections: list[str]
     correction_message: str
     joint_colors: dict[str, str]
+    # Legacy field: aliased to form_confidence
     confidence: float
     timestamp: float
+    # New fields (additive — gymi ignores unknown fields)
+    exercise_confidence: float = 0.0
+    form_confidence: float = 0.0
+    signal_quality: str = "good"
 
 
 class ConnectionManager:
-    """Manages WebSocket connections."""
-    
     def __init__(self):
         self.active_connections: dict[str, WebSocket] = {}
         self.form_managers: dict[str, FormManager] = {}
-    
+        self._last_frame_times: dict[str, float] = {}
+
     async def connect(self, websocket: WebSocket, client_id: str) -> None:
-        """Accept a new WebSocket connection."""
         await websocket.accept()
         self.active_connections[client_id] = websocket
         self.form_managers[client_id] = FormManager()
-    
+        self._last_frame_times[client_id] = 0.0
+
     def disconnect(self, client_id: str) -> None:
-        """Remove a disconnected client."""
-        if client_id in self.active_connections:
-            del self.active_connections[client_id]
-        if client_id in self.form_managers:
-            del self.form_managers[client_id]
-    
+        self.active_connections.pop(client_id, None)
+        self.form_managers.pop(client_id, None)
+        self._last_frame_times.pop(client_id, None)
+
     def get_manager(self, client_id: str) -> Optional[FormManager]:
-        """Get the FormManager for a client."""
         return self.form_managers.get(client_id)
-    
+
+    def should_rate_limit(self, client_id: str, max_fps: int = 60) -> bool:
+        """Return True if this frame should be dropped (rate limit exceeded)."""
+        now = time.time()
+        last = self._last_frame_times.get(client_id, 0.0)
+        if (now - last) < (1.0 / max_fps):
+            return True
+        self._last_frame_times[client_id] = now
+        return False
+
     async def send_response(self, client_id: str, response: FormCorrectionResponse) -> None:
-        """Send a response to a specific client."""
         websocket = self.active_connections.get(client_id)
         if websocket:
             await websocket.send_json(response.model_dump())
 
 
 manager = ConnectionManager()
+_validator = InputValidator()
 
 
 @router.websocket("/ws/pose/{client_id}")
 async def pose_websocket(websocket: WebSocket, client_id: str):
-    """
-    WebSocket endpoint for real-time pose analysis.
-    
-    Client sends: { landmarks: [...], timestamp: float }
-    Server responds: FormCorrectionResponse
-    """
     await manager.connect(websocket, client_id)
     form_manager = manager.get_manager(client_id)
-    
+
     try:
         while True:
-            # Receive landmark data
             data = await websocket.receive_json()
-            
+
             if not data.get("landmarks"):
                 continue
-            
+
+            # Rate limit: drop excess frames silently
+            if manager.should_rate_limit(client_id):
+                continue
+
+            # Validate input
+            try:
+                _validator.validate(data)
+            except ValidationError as e:
+                await websocket.send_json({"error": "invalid_payload", "detail": str(e)})
+                continue
+
             landmarks = data["landmarks"]
             timestamp = data.get("timestamp", 0)
-            
-            # Process frame
+
+            # Process frame through new pipeline
             state = form_manager.process_frame(landmarks)
-            
-            # Build response
+
             response = FormCorrectionResponse(
                 state=state.system_state.value,
                 current_exercise=state.current_exercise.value if state.current_exercise else None,
@@ -108,12 +116,17 @@ async def pose_websocket(websocket: WebSocket, client_id: str):
                 corrections=state.exercise_result.corrections if state.exercise_result else [],
                 correction_message=_build_correction_message(state.exercise_result),
                 joint_colors=state.exercise_result.joint_colors if state.exercise_result else {},
-                confidence=state.motion_analysis.confidence if state.motion_analysis else 0.0,
-                timestamp=timestamp
+                # Legacy field aliased to form_confidence
+                confidence=state.form_confidence,
+                timestamp=timestamp,
+                # New fields
+                exercise_confidence=state.exercise_confidence,
+                form_confidence=state.form_confidence,
+                signal_quality=state.signal_quality,
             )
-            
+
             await manager.send_response(client_id, response)
-            
+
     except WebSocketDisconnect:
         manager.disconnect(client_id)
     except Exception as e:
@@ -122,28 +135,22 @@ async def pose_websocket(websocket: WebSocket, client_id: str):
 
 
 def _build_correction_message(result) -> str:
-    """Build a user-friendly correction message."""
     if not result:
         return ""
-    
     if not result.corrections:
         if result.is_valid:
             return "Great form! Keep it up!"
         return ""
-    
-    # Return the most important correction
     return result.corrections[0] if result.corrections else ""
 
 
 @router.get("/health")
 async def health_check():
-    """Health check endpoint."""
     return {"status": "healthy", "connections": len(manager.active_connections)}
 
 
 @router.post("/reset/{client_id}")
 async def reset_session(client_id: str):
-    """Reset the form manager for a client."""
     form_manager = manager.get_manager(client_id)
     if form_manager:
         form_manager.reset()

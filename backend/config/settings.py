@@ -46,6 +46,28 @@ class Settings(BaseSettings):
     SUPABASE_URL: Optional[str] = None
     SUPABASE_KEY: Optional[str] = None
     SUPABASE_SERVICE_ROLE_KEY: Optional[str] = None
+
+    # Pipeline — Kalman filter
+    KALMAN_PROCESS_NOISE: float = 1e-3
+    KALMAN_MIN_VISIBILITY: float = 0.05
+
+    # Pipeline — HMM
+    HMM_TRANSITION_SELF_LOOP: float = 0.95
+    HMM_TRANSITION_TO_IDLE: float = 0.02
+    HMM_OBSERVATION_VARIANCE_SCALE: float = 1.0
+
+    # Pipeline — ViolationAggregator
+    VIOLATION_AGG_M: int = 4
+    VIOLATION_AGG_N: int = 6
+    VIOLATION_COOLDOWN_FRAMES: int = 15
+
+    # Pipeline — ConfidenceComposer
+    JOINT_IMPORTANCE_SQUAT: str = ""   # JSON dict override (empty = use defaults)
+    JOINT_IMPORTANCE_PUSHUP: str = ""
+    JOINT_IMPORTANCE_CURL: str = ""
+
+    # Pipeline — Rate limiting
+    MAX_FRAMES_PER_SECOND: int = 60
     
     @property
     def CORS_ORIGINS(self) -> List[str]:
