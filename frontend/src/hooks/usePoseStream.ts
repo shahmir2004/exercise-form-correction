@@ -39,11 +39,30 @@ export interface UsePoseStreamReturn {
   error: Error | null;
   connect: () => void;
   disconnect: () => void;
-  sendLandmarks: (landmarks: PoseLandmark[], timestamp: number) => void;
+  sendLandmarks: (landmarks: PoseLandmark[], timestamp: number, clientProbs?: Record<string, number> | null) => void;
   reset: () => Promise<void>;
 }
 
 const DEFAULT_WS_URL = WS_URL;
+
+export function buildPoseMessage(
+  landmarks: PoseLandmark[],
+  timestamp: number,
+  clientProbs: Record<string, number> | null,
+): string {
+  const payload: {
+    landmarks: { x: number; y: number; z: number; visibility: number }[];
+    timestamp: number;
+    client_probs?: Record<string, number>;
+  } = {
+    landmarks: landmarks.map(lm => ({ x: lm.x, y: lm.y, z: lm.z, visibility: lm.visibility })),
+    timestamp,
+  };
+  if (clientProbs !== null && clientProbs !== undefined) {
+    payload.client_probs = clientProbs;
+  }
+  return JSON.stringify(payload);
+}
 
 // Generate stable client ID once
 const stableClientId = `client_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -168,29 +187,24 @@ export function usePoseStream(options: UsePoseStreamOptions = {}): UsePoseStream
     wsRef.current = ws;
   }, [url]);
 
-  const sendLandmarks = useCallback((landmarks: PoseLandmark[], timestamp: number) => {
-    const message = JSON.stringify({
-      landmarks: landmarks.map((lm) => ({
-        x: lm.x,
-        y: lm.y,
-        z: lm.z,
-        visibility: lm.visibility,
-      })),
-      timestamp,
-    });
+  const sendLandmarks = useCallback(
+    (landmarks: PoseLandmark[], timestamp: number, clientProbs?: Record<string, number> | null) => {
+      const message = buildPoseMessage(landmarks, timestamp, clientProbs ?? null);
 
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(message);
-    } else {
-      // Queue message for when connection is established
-      pendingMessagesRef.current.push(message);
-      
-      // Limit queue size
-      if (pendingMessagesRef.current.length > 5) {
-        pendingMessagesRef.current.shift();
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(message);
+      } else {
+        // Queue message for when connection is established
+        pendingMessagesRef.current.push(message);
+
+        // Limit queue size
+        if (pendingMessagesRef.current.length > 5) {
+          pendingMessagesRef.current.shift();
+        }
       }
-    }
-  }, []);
+    },
+    [],
+  );
 
   const reset = useCallback(async () => {
     try {

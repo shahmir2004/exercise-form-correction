@@ -8,6 +8,7 @@ from pathlib import Path
 from config.settings import settings
 from api.routes import router as api_router
 from api.upload import router as upload_router
+from api.pose_library import router as pose_library_router
 
 
 # Create FastAPI app
@@ -29,6 +30,7 @@ app.add_middleware(
 # Include routers
 app.include_router(api_router, prefix="/api")
 app.include_router(upload_router, prefix="/api")
+app.include_router(pose_library_router, prefix="/api")
 
 # Mount uploads directory for serving videos
 uploads_path = Path(settings.UPLOAD_DIR)

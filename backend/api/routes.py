@@ -35,6 +35,8 @@ class FormCorrectionResponse(BaseModel):
     exercise_confidence: float = 0.0
     form_confidence: float = 0.0
     signal_quality: str = "good"
+    exercise_variant: Optional[str] = None
+    exercise_source: str = "pipeline"
 
 
 class ConnectionManager:
@@ -100,10 +102,11 @@ async def pose_websocket(websocket: WebSocket, client_id: str):
                 continue
 
             landmarks = data["landmarks"]
+            client_probs = data.get("client_probs")
             timestamp = data.get("timestamp", 0)
 
             # Process frame through new pipeline
-            state = form_manager.process_frame(landmarks)
+            state = form_manager.process_frame(landmarks, client_probs)
 
             response = FormCorrectionResponse(
                 state=state.system_state.value,
@@ -123,6 +126,8 @@ async def pose_websocket(websocket: WebSocket, client_id: str):
                 exercise_confidence=state.exercise_confidence,
                 form_confidence=state.form_confidence,
                 signal_quality=state.signal_quality,
+                exercise_variant=state.exercise_variant,
+                exercise_source=state.exercise_source,
             )
 
             await manager.send_response(client_id, response)

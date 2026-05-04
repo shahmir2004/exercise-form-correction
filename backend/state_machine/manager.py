@@ -17,6 +17,9 @@ from pipeline.validator import InputValidator, ValidationError
 from pipeline.kalman import KalmanPoseTracker
 from pipeline.features import FeatureExtractor
 from pipeline.hmm import ExerciseHMM, ExState
+from pipeline.pose_embedder import embed_pose
+from pipeline.knn_classifier import PoseKNNClassifier
+from pipeline.fusion import ClassifierFusion
 from pipeline.form_evaluator import FormEvaluator, Violation
 from pipeline.confidence import ConfidenceComposer
 
@@ -27,19 +30,29 @@ class SystemState(str, Enum):
     ACTIVE = "active"
 
 
-_EX_STATE_TO_TYPE: dict[ExState, Optional[ExerciseType]] = {
-    ExState.IDLE: None,
-    ExState.SQUAT: ExerciseType.SQUAT,
-    ExState.PUSHUP: ExerciseType.PUSHUP,
-    ExState.CURL: ExerciseType.BICEP_CURL,
-    ExState.ALT_CURL: ExerciseType.ALTERNATE_BICEP_CURL,
-}
-
 _EX_TYPE_TO_NAME: dict[ExerciseType, str] = {
     ExerciseType.SQUAT: "squat",
     ExerciseType.PUSHUP: "pushup",
     ExerciseType.BICEP_CURL: "bicep_curl",
     ExerciseType.ALTERNATE_BICEP_CURL: "alternate_bicep_curl",
+}
+
+_VARIANT_LABEL_TO_EXERCISE: dict[str, ExerciseType] = {
+    "curl-stand": ExerciseType.BICEP_CURL,
+    "curl-seat": ExerciseType.BICEP_CURL,
+    "alt-stand": ExerciseType.ALTERNATE_BICEP_CURL,
+    "alt-seat": ExerciseType.ALTERNATE_BICEP_CURL,
+    "bicep_curl": ExerciseType.BICEP_CURL,
+    "alternate_bicep_curl": ExerciseType.ALTERNATE_BICEP_CURL,
+    "squat": ExerciseType.SQUAT,
+    "pushup": ExerciseType.PUSHUP,
+}
+
+_VARIANT_DISPLAY: dict[str, str] = {
+    "curl-stand": "Bicep Curl (Standing)",
+    "curl-seat": "Bicep Curl (Seated)",
+    "alt-stand": "Alt Bicep Curl (Standing)",
+    "alt-seat": "Alt Bicep Curl (Seated)",
 }
 
 _EXERCISE_MODULES: dict[ExerciseType, Type[BaseExercise]] = {
@@ -60,6 +73,8 @@ class FormManagerState:
     form_confidence: float = 0.0
     signal_quality: str = "good"
     stable_violations: list = field(default_factory=list)
+    exercise_variant: Optional[str] = None
+    exercise_source: str = "pipeline"
     # Kept for backwards compat (was MotionAnalysis)
     motion_analysis: Optional[object] = None
     time_in_state: float = 0.0
@@ -81,6 +96,9 @@ class FormManager:
         self._kalman = KalmanPoseTracker()
         self._feature_extractor = FeatureExtractor()
         self._hmm = ExerciseHMM()
+        self._embedder = embed_pose
+        self._knn = PoseKNNClassifier()
+        self._fusion = ClassifierFusion()
         self._form_evaluator = FormEvaluator()
         self._confidence_composer = ConfidenceComposer()
 
@@ -92,12 +110,23 @@ class FormManager:
         self._frames_processed = 0
         self._last_result: Optional[ExerciseResult] = None
         self._last_frame_time: Optional[float] = None
+        self._last_rep_phase: str = "idle"
+        self._current_variant: Optional[str] = None
+        self._exercise_source: str = "pipeline"
+        self._pending_exercise: Optional[ExerciseType] = None
+        self._pending_variant: Optional[str] = None
+        self._pending_frames: int = 0
+        self._pending_since: Optional[float] = None
 
         # Per-client rate limiting
-        self._max_fps: int = 60
+        self._max_fps: int = settings.MAX_FRAMES_PER_SECOND
         self._frame_interval: float = 1.0 / self._max_fps
 
-    def process_frame(self, landmarks: list[dict]) -> FormManagerState:
+    def process_frame(
+        self,
+        landmarks: list[dict],
+        client_probs: Optional[dict] = None,
+    ) -> FormManagerState:
         """
         Process a single frame.
 
@@ -134,7 +163,23 @@ class FormManager:
 
         # 4. HMM classification
         hmm_result = self._hmm.update(frame)
-        ex_conf = hmm_result.exercise_confidence
+
+        # 4b. k-NN classification + fusion
+        embedding = self._embedder(frame.coords, frame.torso_length)
+        knn_ex, knn_conf = self._knn.classify(embedding)
+        fusion_result = self._fusion.fuse(hmm_result, knn_ex, knn_conf)
+        candidate_exercise = fusion_result.exercise
+        candidate_conf = fusion_result.confidence
+        candidate_variant = (
+            _EX_TYPE_TO_NAME.get(candidate_exercise) if candidate_exercise else None
+        )
+        candidate_source = fusion_result.source
+
+        # 4c. External classifier (ST-GCN) override if confident
+        ext = self._parse_external_probs(client_probs)
+        if ext and ext[2] >= settings.EXTERNAL_CLASSIFIER_MIN_CONFIDENCE:
+            candidate_exercise, candidate_variant, candidate_conf = ext
+            candidate_source = "external"
 
         # 5. Map HMM state to system state
         idle_posterior = float(hmm_result.posterior[ExState.IDLE])
@@ -146,6 +191,12 @@ class FormManager:
             new_sys_state = SystemState.SCANNING
         else:
             new_sys_state = SystemState.ACTIVE
+
+        if candidate_exercise is not None:
+            if candidate_conf >= 0.7:
+                new_sys_state = SystemState.ACTIVE
+            elif candidate_conf >= 0.3 and new_sys_state == SystemState.IDLE:
+                new_sys_state = SystemState.SCANNING
 
         if new_sys_state != self._state:
             self._state = new_sys_state
@@ -166,17 +217,28 @@ class FormManager:
         #       running it so the rep counter sees the angle returning to
         #       extension. Letting the HMM gate every frame's rep update
         #       resets reps mid-set.
-        detected_ex = _EX_STATE_TO_TYPE.get(hmm_result.most_likely_state)
-        if (
-            detected_ex is not None
-            and ex_conf >= settings.MIN_CONFIDENCE_FOR_REPS
-            and new_sys_state != SystemState.IDLE
-        ):
-            if detected_ex != self._current_exercise:
-                self._activate_module(detected_ex)
+        detected_ex = candidate_exercise
+
+        # 6. Confidence composition (before switching, for quality gating)
+        ex_name = _EX_TYPE_TO_NAME.get(self._current_exercise)
+        conf_result = self._confidence_composer.compose(
+            candidate_conf, frame, validated.quality_flags, ex_name
+        )
+
+        # 6b. Exercise switching with hysteresis + rep-phase gating
+        self._maybe_switch_exercise(
+            detected_ex,
+            candidate_variant,
+            candidate_conf,
+            candidate_source,
+            new_sys_state,
+            conf_result.signal_quality,
+        )
 
         if self._active_module is not None:
             self._last_result = self._active_module.process_frame(landmarks)
+            if self._last_result is not None:
+                self._last_rep_phase = self._last_result.rep_phase
 
         # 7. Form evaluation (pipeline-based, temporally stable)
         ex_name = _EX_TYPE_TO_NAME.get(self._current_exercise)
@@ -193,11 +255,6 @@ class FormManager:
                 for joint in v.joints:
                     self._last_result.joint_colors[joint] = v.severity
 
-        # 8. Confidence composition
-        conf_result = self._confidence_composer.compose(
-            ex_conf, frame, validated.quality_flags, ex_name
-        )
-
         t_elapsed_ms = (time.perf_counter() - t_start) * 1000
         if t_elapsed_ms > 25:
             import logging
@@ -212,11 +269,119 @@ class FormManager:
             stable_violations,
         )
 
-    def _activate_module(self, exercise_type: ExerciseType) -> None:
+    def _activate_module(
+        self,
+        exercise_type: ExerciseType,
+        variant: Optional[str],
+        source: str,
+    ) -> None:
+        if self._active_module and self._current_exercise == exercise_type:
+            # Same base exercise; update variant label without resetting reps
+            self._current_variant = variant or self._current_variant
+            self._exercise_source = source
+            return
         module_class = _EXERCISE_MODULES.get(exercise_type)
         if module_class:
             self._active_module = module_class()
             self._current_exercise = exercise_type
+            self._current_variant = variant or _EX_TYPE_TO_NAME.get(exercise_type)
+            self._exercise_source = source
+
+    def _reset_pending(self) -> None:
+        self._pending_exercise = None
+        self._pending_variant = None
+        self._pending_frames = 0
+        self._pending_since = None
+
+    def _is_safe_to_switch(self) -> bool:
+        return self._last_rep_phase in ("idle", "ready")
+
+    def _maybe_switch_exercise(
+        self,
+        candidate_exercise: Optional[ExerciseType],
+        candidate_variant: Optional[str],
+        candidate_conf: float,
+        candidate_source: str,
+        new_sys_state: SystemState,
+        signal_quality: str,
+    ) -> None:
+        if candidate_exercise is None or new_sys_state == SystemState.IDLE:
+            self._reset_pending()
+            return
+
+        if settings.BLOCK_SWITCH_ON_UNRELIABLE and signal_quality == "unreliable":
+            self._reset_pending()
+            return
+
+        required_conf = (
+            settings.MIN_CONFIDENCE_FOR_REPS
+            if self._current_exercise is None
+            else settings.EXERCISE_SWITCH_CONFIDENCE
+        )
+        if candidate_conf < required_conf:
+            self._reset_pending()
+            return
+
+        if (
+            candidate_exercise == self._current_exercise
+            and candidate_variant == self._current_variant
+        ):
+            self._reset_pending()
+            return
+
+        now = time.time()
+        if (
+            candidate_exercise != self._pending_exercise
+            or candidate_variant != self._pending_variant
+        ):
+            self._pending_exercise = candidate_exercise
+            self._pending_variant = candidate_variant
+            self._pending_frames = 1
+            self._pending_since = now
+            return
+
+        self._pending_frames += 1
+        if not self._is_safe_to_switch():
+            return
+
+        if self._pending_since is None:
+            self._pending_since = now
+
+        if (
+            self._pending_frames >= settings.EXERCISE_SWITCH_MIN_FRAMES
+            and (now - self._pending_since) >= settings.EXERCISE_SWITCH_MIN_SECONDS
+        ):
+            self._activate_module(candidate_exercise, candidate_variant, candidate_source)
+            self._reset_pending()
+
+    def _parse_external_probs(
+        self,
+        client_probs: Optional[dict],
+    ) -> Optional[tuple[ExerciseType, str, float]]:
+        if not isinstance(client_probs, dict) or not client_probs:
+            return None
+
+        best_label = None
+        best_score = -1.0
+        for label, score in client_probs.items():
+            if not isinstance(label, str):
+                continue
+            try:
+                score_val = float(score)
+            except (TypeError, ValueError):
+                continue
+            if score_val > best_score:
+                best_label = label
+                best_score = score_val
+
+        if best_label is None:
+            return None
+
+        exercise = _VARIANT_LABEL_TO_EXERCISE.get(best_label)
+        if exercise is None:
+            return None
+
+        return exercise, best_label, float(best_score)
 
     def _create_state(
         self,
@@ -238,12 +403,19 @@ class FormManager:
             form_confidence=form_conf,
             signal_quality=signal_quality,
             stable_violations=stable_violations,
+            exercise_variant=self._current_variant,
+            exercise_source=self._exercise_source,
             motion_analysis=_FakeAnalysis(form_conf),  # backwards compat: confidence = form_confidence
             time_in_state=time.time() - self._state_start_time,
             frames_processed=self._frames_processed,
         )
 
     def get_exercise_name(self) -> str:
+        if self._current_variant:
+            return _VARIANT_DISPLAY.get(
+                self._current_variant,
+                self._current_variant.replace("_", " ").replace("-", " ").title(),
+            )
         if self._active_module:
             return self._active_module.name
         if self._current_exercise:
@@ -261,14 +433,22 @@ class FormManager:
         self._state = SystemState.IDLE
         self._current_exercise = None
         self._active_module = None
+        self._current_variant = None
+        self._exercise_source = "pipeline"
+        self._pending_exercise = None
+        self._pending_variant = None
+        self._pending_frames = 0
+        self._pending_since = None
         self._state_start_time = time.time()
         self._frames_processed = 0
         self._last_result = None
         self._last_frame_time = None
+        self._last_rep_phase = "idle"
         self._validator.reset()
         self._kalman.reset()
         self._feature_extractor.reset()
         self._hmm.reset()
+        self._fusion.reset()
         self._form_evaluator.reset()
 
     @property
