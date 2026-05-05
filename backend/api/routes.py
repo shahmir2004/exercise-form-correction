@@ -1,7 +1,5 @@
 """WebSocket API for real-time exercise form correction."""
 
-import json
-import asyncio
 import time
 from typing import Optional
 
@@ -9,8 +7,6 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from state_machine.manager import FormManager, SystemState
-from exercises.classifier import ExerciseType
-from pipeline.validator import InputValidator, ValidationError
 
 
 router = APIRouter()
@@ -75,7 +71,6 @@ class ConnectionManager:
 
 
 manager = ConnectionManager()
-_validator = InputValidator()
 
 
 @router.websocket("/ws/pose/{client_id}")
@@ -92,13 +87,6 @@ async def pose_websocket(websocket: WebSocket, client_id: str):
 
             # Rate limit: drop excess frames silently
             if manager.should_rate_limit(client_id):
-                continue
-
-            # Validate input
-            try:
-                _validator.validate(data)
-            except ValidationError as e:
-                await websocket.send_json({"error": "invalid_payload", "detail": str(e)})
                 continue
 
             landmarks = data["landmarks"]

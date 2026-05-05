@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from pipeline.features import FeatureExtractor, BodyFrame, ViewEstimate, calculate_angle, calculate_3d_angle
+from pipeline.features import FeatureExtractor, BodyFrame, ViewEstimate, calculate_angle
 
 
 def _make_xyz(pattern="standing"):

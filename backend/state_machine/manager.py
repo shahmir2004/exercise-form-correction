@@ -7,8 +7,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Type
 
 from config.settings import settings
-from exercises.base import BaseExercise, ExerciseResult
-from exercises.classifier import ExerciseType
+from exercises.base import BaseExercise, ExerciseResult, ExerciseType
 from exercises.squat import SquatModule
 from exercises.pushup import PushupModule
 from exercises.bicep_curl import BicepCurlModule, AlternateBicepCurlModule
@@ -75,8 +74,6 @@ class FormManagerState:
     stable_violations: list = field(default_factory=list)
     exercise_variant: Optional[str] = None
     exercise_source: str = "pipeline"
-    # Kept for backwards compat (was MotionAnalysis)
-    motion_analysis: Optional[object] = None
     time_in_state: float = 0.0
     frames_processed: int = 0
 
@@ -109,7 +106,6 @@ class FormManager:
         self._state_start_time = time.time()
         self._frames_processed = 0
         self._last_result: Optional[ExerciseResult] = None
-        self._last_frame_time: Optional[float] = None
         self._last_rep_phase: str = "idle"
         self._current_variant: Optional[str] = None
         self._exercise_source: str = "pipeline"
@@ -117,10 +113,6 @@ class FormManager:
         self._pending_variant: Optional[str] = None
         self._pending_frames: int = 0
         self._pending_since: Optional[float] = None
-
-        # Per-client rate limiting
-        self._max_fps: int = settings.MAX_FRAMES_PER_SECOND
-        self._frame_interval: float = 1.0 / self._max_fps
 
     def process_frame(
         self,
@@ -137,15 +129,7 @@ class FormManager:
         """
         self._frames_processed += 1
         t_start = time.perf_counter()
-
-        # Rate limiting
         now = time.time()
-        if self._last_frame_time is not None:
-            elapsed = now - self._last_frame_time
-            if elapsed < self._frame_interval:
-                # Drop frame silently
-                return self._create_state(0.0, 0.0, "good", [])
-        self._last_frame_time = now
 
         # 1. Validate
         try:
@@ -390,11 +374,6 @@ class FormManager:
         signal_quality: str,
         stable_violations: list,
     ) -> FormManagerState:
-        # Build a minimal MotionAnalysis-like object for backwards compat
-        # (routes.py reads motion_analysis.confidence)
-        class _FakeAnalysis:
-            def __init__(self, c):
-                self.confidence = c
         return FormManagerState(
             system_state=self._state,
             current_exercise=self._current_exercise,
@@ -405,7 +384,6 @@ class FormManager:
             stable_violations=stable_violations,
             exercise_variant=self._current_variant,
             exercise_source=self._exercise_source,
-            motion_analysis=_FakeAnalysis(form_conf),  # backwards compat: confidence = form_confidence
             time_in_state=time.time() - self._state_start_time,
             frames_processed=self._frames_processed,
         )
@@ -442,7 +420,6 @@ class FormManager:
         self._state_start_time = time.time()
         self._frames_processed = 0
         self._last_result = None
-        self._last_frame_time = None
         self._last_rep_phase = "idle"
         self._validator.reset()
         self._kalman.reset()

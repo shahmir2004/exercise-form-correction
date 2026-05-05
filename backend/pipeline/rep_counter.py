@@ -141,6 +141,10 @@ class HysteresisRepCounter:
 
         return self._phase, rep_completed
 
+    def record_violations(self, violations: list[str]) -> None:
+        """Append form violations for the in-progress rep (called after form check)."""
+        self._form_violations.extend(violations)
+
     def _is_valid_rep(self, duration: float) -> bool:
         if duration < self.min_rep_duration or duration > self.max_rep_duration:
             return False

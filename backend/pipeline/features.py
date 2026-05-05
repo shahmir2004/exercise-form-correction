@@ -67,11 +67,6 @@ def calculate_angle(p1: np.ndarray, p2: np.ndarray, p3: np.ndarray) -> float:
     return float(np.degrees(np.arccos(cos_a)))
 
 
-def calculate_3d_angle(p1: np.ndarray, p2: np.ndarray, p3: np.ndarray) -> float:
-    """Alias for calculate_angle — explicit 3D name."""
-    return calculate_angle(p1, p2, p3)
-
-
 def _estimate_view(xyz: np.ndarray) -> ViewEstimate:
     """
     Estimate camera view angle from shoulder–hip triangle aspect ratio.

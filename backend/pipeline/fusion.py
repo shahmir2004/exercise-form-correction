@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from typing import Optional
 
-from exercises.classifier import ExerciseType
+from exercises.base import ExerciseType
 
 from .hmm import ExState, HMMResult
 

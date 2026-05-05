@@ -9,6 +9,15 @@ import numpy as np
 from utils.rep_counter import HysteresisRepCounter, RepPhase, RepQuality
 
 
+class ExerciseType(str, Enum):
+    """Recognized exercise types."""
+    UNKNOWN = "unknown"
+    SQUAT = "squat"
+    PUSHUP = "pushup"
+    BICEP_CURL = "bicep_curl"
+    ALTERNATE_BICEP_CURL = "alternate_bicep_curl"
+
+
 class JointName(str, Enum):
     """MediaPipe pose landmark names."""
     NOSE = "nose"
@@ -310,7 +319,17 @@ class BaseExercise(ABC):
         result.rep_phase = current_phase
         result.rep_quality = self.rep_quality
         result.partial_reps = self.partial_reps
-        
+
+        # Feed violations into rep counter(s) so form_score reflects actual form
+        if result.violations:
+            if self._rep_counter:
+                self._rep_counter.record_violations(result.violations)
+            # AlternateBicepCurlModule uses per-arm counters
+            for attr in ("_left_rep_counter", "_right_rep_counter"):
+                counter = getattr(self, attr, None)
+                if counter is not None:
+                    counter.record_violations(result.violations)
+
         return result
     
     def _is_rep_complete(self, last_phase: str, current_phase: str) -> bool:

@@ -6,7 +6,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-from exercises.classifier import ExerciseType
+from exercises.base import ExerciseType
 
 
 class PoseKNNClassifier:
