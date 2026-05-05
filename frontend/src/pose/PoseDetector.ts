@@ -137,7 +137,6 @@ export class PoseDetector {
       const results = this.poseLandmarker.detectForVideo(videoElement, startTime);
 
       if (!results.landmarks || results.landmarks.length === 0) {
-        this.processingFrame = false;
         return null;
       }
 
@@ -158,12 +157,12 @@ export class PoseDetector {
       };
 
       this.onResultsCallback?.(poseResult);
-      this.processingFrame = false;
       return poseResult;
     } catch (error) {
-      this.processingFrame = false;
       console.error('Error detecting pose:', error);
       return null;
+    } finally {
+      this.processingFrame = false;
     }
   }
 

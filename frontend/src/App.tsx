@@ -19,6 +19,8 @@ import {
 import { Activity, Wifi, WifiOff } from 'lucide-react';
 import { API_BASE_URL, IS_DEVELOPMENT } from './config';
 
+const STGCN_INFER_INTERVAL_MS = 150;
+
 type PoseLibraryFrame = {
   landmarks: PoseLandmark[];
   timestamp: number;
@@ -76,6 +78,7 @@ function App() {
   const stgcnRef = useRef<STGCNClassifier | null>(null);
   const stgcnWindowRef = useRef<Float32Array[]>([]);
   const clientProbsRef = useRef<Record<string, number> | null>(null);
+  const stgcnLastInferRef = useRef<number>(0);
 
   // Video processor hook
   const {
@@ -127,6 +130,8 @@ function App() {
       connect();
     } else if (!isProcessing && isConnected) {
       stgcnWindowRef.current = [];
+      clientProbsRef.current = null;
+      stgcnLastInferRef.current = 0;
       disconnect();
     }
   }, [isProcessing, isConnected, isConnecting, connect, disconnect]);
@@ -143,7 +148,7 @@ function App() {
   useEffect(() => {
     if (!currentLandmarks || !isConnected || !isProcessing) return;
 
-    let probs: Record<string, number> | null = null;
+    const now = performance.now();
     const clf = stgcnRef.current;
     if (clf?.isReady) {
       const frame = extractNormalisedFrame(currentLandmarks);
@@ -152,14 +157,18 @@ function App() {
         if (stgcnWindowRef.current.length > STGCN_WINDOW) {
           stgcnWindowRef.current.shift();
         }
-        if (stgcnWindowRef.current.length === STGCN_WINDOW) {
-          probs = clf.infer(stgcnWindowRef.current);
+        if (
+          stgcnWindowRef.current.length === STGCN_WINDOW &&
+          now - stgcnLastInferRef.current >= STGCN_INFER_INTERVAL_MS
+        ) {
+          const probs = clf.infer(stgcnWindowRef.current);
+          stgcnLastInferRef.current = now;
           if (probs) clientProbsRef.current = probs;
         }
       }
     }
 
-    sendLandmarks(currentLandmarks, performance.now(), probs);
+    sendLandmarks(currentLandmarks, now, clientProbsRef.current);
   }, [currentLandmarks, isConnected, isProcessing, sendLandmarks]);
 
   const updatePoseLibraryStats = useCallback(() => {
@@ -297,6 +306,9 @@ function App() {
 
   const handleStopCamera = useCallback(() => {
     stopSource();
+    stgcnWindowRef.current = [];
+    clientProbsRef.current = null;
+    stgcnLastInferRef.current = 0;
     setCurrentLandmarks(null);
     setFormResponse(null);
   }, [stopSource]);
@@ -419,6 +431,10 @@ function App() {
                 <li className="flex items-center gap-2">
                   <span className="w-2 h-2 rounded-full bg-blue-500" />
                   <span className="text-gray-300">Bicep Curls</span>
+                </li>
+                <li className="flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-blue-500" />
+                  <span className="text-gray-300">Alternate Bicep Curls</span>
                 </li>
               </ul>
             </div>

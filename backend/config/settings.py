@@ -15,11 +15,9 @@ def get_cors_origins() -> List[str]:
             return ["*"]
         return [origin.strip() for origin in env_value.split(',') if origin.strip()]
     return [
-        "*",  # Allow all origins for development
         "http://localhost:3000", 
         "http://localhost:5173",
         "https://exercise-form-correction.vercel.app",
-        "https://*.vercel.app",
     ]
 
 
@@ -30,7 +28,7 @@ class Settings(BaseSettings):
     # Server settings
     HOST: str = "0.0.0.0"
     PORT: int = 8000
-    DEBUG: bool = True
+    DEBUG: bool = False
     
     # Upload settings
     UPLOAD_DIR: str = "./uploads"
@@ -89,11 +87,19 @@ class Settings(BaseSettings):
 
     # Pipeline — Rate limiting
     MAX_FRAMES_PER_SECOND: int = 60
+    MAX_CLIENT_ID_LENGTH: int = 80
+    CORS_ALLOW_CREDENTIALS: bool = False
+    CORS_ORIGIN_REGEX: Optional[str] = None
     
     @property
     def CORS_ORIGINS(self) -> List[str]:
         """Get CORS origins from environment."""
         return get_cors_origins()
+
+    @property
+    def EFFECTIVE_CORS_ALLOW_CREDENTIALS(self) -> bool:
+        """Wildcard CORS cannot be safely combined with credentials."""
+        return self.CORS_ALLOW_CREDENTIALS and "*" not in self.CORS_ORIGINS
     
     @field_validator("DEBUG", mode="before")
     @classmethod

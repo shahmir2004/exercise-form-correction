@@ -18,4 +18,6 @@ services:
       - key: DEBUG
         value: "false"
       - key: CORS_ORIGINS
-        value: "https://exercise-form-correction.vercel.app,https://*.vercel.app"
+        value: "https://exercise-form-correction.vercel.app"
+      - key: CORS_ORIGIN_REGEX
+        value: "https://.*\\.vercel\\.app"

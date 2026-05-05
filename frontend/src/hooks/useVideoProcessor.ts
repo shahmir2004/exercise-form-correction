@@ -75,6 +75,7 @@ export function useVideoProcessor(options: UseVideoProcessorOptions = {}): UseVi
   const motionBufferRef = useRef<MotionBuffer>(new MotionBuffer(bufferSize));
   const animationFrameRef = useRef<number | null>(null);
   const lastProcessTimeRef = useRef<number>(0);
+  const lastVideoTimeRef = useRef<number>(-1);
   const isProcessingRef = useRef(false);
   
   // Store callbacks in refs to avoid recreating effects
@@ -272,8 +273,14 @@ export function useVideoProcessor(options: UseVideoProcessorOptions = {}): UseVi
     const frameInterval = 1000 / targetFpsRef.current;
 
     if (now - lastProcessTimeRef.current >= frameInterval) {
+      const videoTime = videoElementRef.current.currentTime;
+      if (videoTime === lastVideoTimeRef.current) {
+        animationFrameRef.current = requestAnimationFrame(processFrame);
+        return;
+      }
+      lastVideoTimeRef.current = videoTime;
       lastProcessTimeRef.current = now;
-      poseDetectorRef.current.processFrame(videoElementRef.current);
+      void poseDetectorRef.current.processFrame(videoElementRef.current);
     }
 
     animationFrameRef.current = requestAnimationFrame(processFrame);
@@ -291,7 +298,8 @@ export function useVideoProcessor(options: UseVideoProcessorOptions = {}): UseVi
 
     isProcessingRef.current = true;
     setIsProcessing(true);
-    lastProcessTimeRef.current = performance.now();
+    lastProcessTimeRef.current = 0;
+    lastVideoTimeRef.current = -1;
     animationFrameRef.current = requestAnimationFrame(processFrame);
   }, [isPoseReady, videoElement, processFrame]);
 

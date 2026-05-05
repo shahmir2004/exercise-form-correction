@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, conlist
 
 from config.settings import settings
+from exercises.registry import POSE_LIBRARY_LABELS
 from pipeline.kalman import KalmanPoseTracker
 from pipeline.features import FeatureExtractor
 from pipeline.pose_embedder import embed_pose
@@ -18,13 +19,7 @@ from pipeline.pose_embedder import embed_pose
 router = APIRouter(prefix="/pose-library", tags=["pose-library"])
 
 
-_ALLOWED_EXERCISES = {
-    "squat",
-    "pushup",
-    "bicep_curl",
-    "alternate_bicep_curl",
-    "idle",
-}
+_ALLOWED_EXERCISES = POSE_LIBRARY_LABELS
 
 _KEY_VISIBILITY = [11, 12, 23, 24]
 

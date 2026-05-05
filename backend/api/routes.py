@@ -1,15 +1,21 @@
 """WebSocket API for real-time exercise form correction."""
 
+import logging
+import re
 import time
 from typing import Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
+from config.settings import settings
+from exercises.registry import supported_exercises_payload
 from state_machine.manager import FormManager, SystemState
 
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+_CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
 
 
 class FormCorrectionResponse(BaseModel):
@@ -55,8 +61,9 @@ class ConnectionManager:
     def get_manager(self, client_id: str) -> Optional[FormManager]:
         return self.form_managers.get(client_id)
 
-    def should_rate_limit(self, client_id: str, max_fps: int = 60) -> bool:
+    def should_rate_limit(self, client_id: str, max_fps: Optional[int] = None) -> bool:
         """Return True if this frame should be dropped (rate limit exceeded)."""
+        max_fps = max_fps or settings.MAX_FRAMES_PER_SECOND
         now = time.time()
         last = self._last_frame_times.get(client_id, 0.0)
         if (now - last) < (1.0 / max_fps):
@@ -75,6 +82,13 @@ manager = ConnectionManager()
 
 @router.websocket("/ws/pose/{client_id}")
 async def pose_websocket(websocket: WebSocket, client_id: str):
+    if (
+        len(client_id) > settings.MAX_CLIENT_ID_LENGTH
+        or not _CLIENT_ID_RE.fullmatch(client_id)
+    ):
+        await websocket.close(code=1008, reason="Invalid client_id")
+        return
+
     await manager.connect(websocket, client_id)
     form_manager = manager.get_manager(client_id)
 
@@ -122,8 +136,8 @@ async def pose_websocket(websocket: WebSocket, client_id: str):
 
     except WebSocketDisconnect:
         manager.disconnect(client_id)
-    except Exception as e:
-        print(f"WebSocket error for {client_id}: {e}")
+    except Exception:
+        logger.exception("WebSocket error for client_id=%s", client_id)
         manager.disconnect(client_id)
 
 
@@ -139,7 +153,17 @@ def _build_correction_message(result) -> str:
 
 @router.get("/health")
 async def health_check():
-    return {"status": "healthy", "connections": len(manager.active_connections)}
+    return {
+        "status": "healthy",
+        "connections": len(manager.active_connections),
+        "supported_exercises": supported_exercises_payload(),
+    }
+
+
+@router.get("/exercises")
+async def list_supported_exercises():
+    """List exercise labels currently supported by the detection pipeline."""
+    return {"exercises": supported_exercises_payload()}
 
 
 @router.post("/reset/{client_id}")

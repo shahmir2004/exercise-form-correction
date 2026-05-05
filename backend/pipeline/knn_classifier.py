@@ -7,15 +7,10 @@ from typing import Optional, Tuple
 import numpy as np
 
 from exercises.base import ExerciseType
+from exercises.registry import POSE_LIBRARY_LABELS
 
 
-REQUIRED_EXERCISE_LABELS = {
-    "squat",
-    "pushup",
-    "bicep_curl",
-    "alternate_bicep_curl",
-    "idle",
-}
+REQUIRED_EXERCISE_LABELS = set(POSE_LIBRARY_LABELS)
 
 
 class PoseKNNClassifier:
