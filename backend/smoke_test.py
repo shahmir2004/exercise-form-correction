@@ -119,8 +119,8 @@ def run_squat_test() -> None:
     return m.rep_count
 
 
-def run_alt_curl_test() -> int:
-    """Returns the number of bad flips (away from ALT_CURL after lock-in)."""
+def run_alt_curl_test() -> tuple[int, int]:
+    """Returns (bad flips away from ALT_CURL, counted reps)."""
     print("\n=== Alt-curl test (5 cycles) ===")
     m = FormManager()
     bad_flips = 0
@@ -144,19 +144,19 @@ def run_alt_curl_test() -> int:
     print(f"  FINAL alt_curl rep_count={m.rep_count}")
     print(f"  FINAL exercise={m.current_exercise}")
     print(f"  Bad flips (to non-curl): {bad_flips}")
-    return bad_flips
+    return bad_flips, m.rep_count
 
 
 if __name__ == "__main__":
     try:
         squat_reps = run_squat_test()
-        bad_flips = run_alt_curl_test()
-        ok = (squat_reps >= 4) and (bad_flips == 0)
+        bad_flips, alt_reps = run_alt_curl_test()
+        ok = (squat_reps >= 5) and (bad_flips == 0) and (alt_reps >= 8)
         print()
         if ok:
-            print("SMOKE OK: squat reps counted, alt-curl stayed on a curl class.")
+            print("SMOKE OK: squat and alt-curl reps counted with stable exercise detection.")
             sys.exit(0)
-        print(f"SMOKE FAIL: squat_reps={squat_reps} bad_flips={bad_flips}")
+        print(f"SMOKE FAIL: squat_reps={squat_reps} alt_reps={alt_reps} bad_flips={bad_flips}")
         sys.exit(1)
     except Exception as e:
         print(f"\nSMOKE TEST CRASH: {type(e).__name__}: {e}")

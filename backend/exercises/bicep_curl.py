@@ -18,6 +18,15 @@ class BicepCurlModule(BaseExercise):
     
     Supports both standing and seated bicep curls.
     """
+
+    PHASE_MAP = {
+        "idle": "idle",
+        "ready": "ready",
+        "down": "up",       # Elbow angle decreasing: curling upward.
+        "up": "down",       # Elbow angle increasing: lowering to extension.
+        "hold": "hold",
+        "transition": "transition",
+    }
     
     # Form thresholds - IMPROVED for better detection
     MIN_ELBOW_ANGLE = 50   # Was 30 - top of curl (more forgiving)
@@ -35,6 +44,8 @@ class BicepCurlModule(BaseExercise):
     MIN_VISIBILITY = 0.3   # Lowered from implicit 0.5
     SMOOTHING_WINDOW = 5   # Number of frames for angle smoothing
     MIN_FRAMES_TO_CONFIRM = 3  # Frames needed to confirm state change
+    REP_EXTENDED_THRESHOLD = 140
+    REP_CONTRACTED_THRESHOLD = 130
     
     # Seated detection
     SEATED_HIP_ANGLE_MIN = 70   # Hip angle when seated (bent at hips)
@@ -46,7 +57,6 @@ class BicepCurlModule(BaseExercise):
         super().__init__()
         self._lowest_elbow_angle = 180.0
         self._highest_elbow_angle = 0.0
-        self._in_curl = False
         self._initial_shoulder_x: Optional[float] = None
         self._initial_shoulder_y: Optional[float] = None
         self._active_arm: Optional[str] = None  # "left", "right", or "both"
@@ -66,9 +76,11 @@ class BicepCurlModule(BaseExercise):
         
         # Create hysteresis-based rep counter for stable counting
         self._create_rep_counter(
-            upper_threshold=self.MAX_ELBOW_ANGLE - 10,  # ~135 degrees
-            lower_threshold=self.MIN_ELBOW_ANGLE + 20    # ~70 degrees
+            upper_threshold=self.REP_EXTENDED_THRESHOLD,
+            lower_threshold=self.REP_CONTRACTED_THRESHOLD,
         )
+        if self._rep_counter:
+            self._rep_counter.min_rep_duration = 0.3
     
     @property
     def name(self) -> str:
@@ -300,7 +312,7 @@ class BicepCurlModule(BaseExercise):
         return full_extension, full_contraction
     
     def detect_rep_phase(self, landmarks: dict[JointName, Landmark]) -> str:
-        """Detect current phase of bicep curl repetition with hysteresis rep counter."""
+        """Detect current phase of bicep curl repetition using hysteresis rep counter."""
         angles = self._calculate_angles(landmarks)
         
         # Detect which arm is active
@@ -316,7 +328,8 @@ class BicepCurlModule(BaseExercise):
             left_angle = None
             right_angle = angles.right_elbow
         else:
-            elbow_angle = min(angles.left_elbow, angles.right_elbow)  # Use most curled
+            # Both arms - use the most curled angle
+            elbow_angle = min(angles.left_elbow, angles.right_elbow)
             left_angle = angles.left_elbow
             right_angle = angles.right_elbow
         
@@ -328,13 +341,9 @@ class BicepCurlModule(BaseExercise):
                 right_angle=right_angle
             )
             
-            # Track min/max for ROM validation
+            # Track min/max for ROM validation and depth checking
             self._lowest_elbow_angle = min(self._lowest_elbow_angle, elbow_angle)
             self._highest_elbow_angle = max(self._highest_elbow_angle, elbow_angle)
-            
-            # Update internal state to match counter
-            if phase_str in ["up", "down", "hold"]:
-                self._in_curl = phase_str in ["up", "hold"]
             
             if rep_completed:
                 # Reset tracking for next rep
@@ -343,52 +352,8 @@ class BicepCurlModule(BaseExercise):
             
             return phase_str
         
-        # Fallback to legacy detection if counter not available
-        # Apply hysteresis for state transitions
-        if self._in_curl:
-            # Currently in curl - need to extend past threshold + hysteresis to exit
-            extension_threshold = self.MAX_ELBOW_ANGLE - self.ANGLE_HYSTERESIS
-            contraction_threshold = self.MIN_ELBOW_ANGLE + self.ANGLE_HYSTERESIS
-        else:
-            # Currently extended - need to curl past threshold - hysteresis to enter
-            extension_threshold = self.MAX_ELBOW_ANGLE
-            contraction_threshold = self.MIN_ELBOW_ANGLE + (self.ANGLE_HYSTERESIS * 2)
-        
-        if elbow_angle > extension_threshold:
-            # Arms extended (bottom position)
-            if self._in_curl:
-                # Confirm with multiple frames
-                self._extend_confirm_count += 1
-                if self._extend_confirm_count >= self.MIN_FRAMES_TO_CONFIRM:
-                    self._in_curl = False
-                    self._extend_confirm_count = 0
-                    self._curl_confirm_count = 0
-                    # Reset tracking for next rep
-                    self._lowest_elbow_angle = 180.0
-                    self._highest_elbow_angle = 0.0
-                    return "down"
-                return "down"  # Transitioning down
-            return "idle"
-        elif elbow_angle < contraction_threshold:
-            # Top of curl (contracted)
-            self._curl_confirm_count += 1
-            if self._curl_confirm_count >= self.MIN_FRAMES_TO_CONFIRM:
-                self._in_curl = True
-                self._curl_confirm_count = 0
-                self._extend_confirm_count = 0
-            return "hold"
-        else:
-            # Transitioning - reset confirm counters
-            self._curl_confirm_count = 0
-            self._extend_confirm_count = 0
-            
-            if self._in_curl:
-                if elbow_angle > self._lowest_elbow_angle + 15:
-                    return "down"
-                return "up"
-            else:
-                self._in_curl = True
-                return "up"
+        # Fallback: Should not reach here if rep counter is properly initialized
+        return "idle"
     
     def check_form(self, landmarks: dict[JointName, Landmark]) -> ExerciseResult:
         """Analyze bicep curl form and return corrections.
@@ -399,8 +364,10 @@ class BicepCurlModule(BaseExercise):
         corrections = []
         joint_colors = {}
         
-        # Calculate angles
-        angles = self._calculate_angles(landmarks)
+        # Reuse the angles calculated by detect_rep_phase for this frame.
+        # Recomputing here advances the smoothing buffers twice and can make
+        # the rep counter reject valid reps as partial.
+        angles = self._last_angles or self._calculate_angles(landmarks)
         
         # Detect if user is seated
         self._is_seated = self._detect_seated_position(landmarks)
@@ -457,7 +424,7 @@ class BicepCurlModule(BaseExercise):
         full_extension, full_contraction = self._check_full_rom(angles)
         
         # Only check ROM if we're in an active curl (reduce false positives)
-        if self._in_curl and self.current_phase == "hold" and not full_contraction:
+        if self.current_phase in ("up", "hold") and not full_contraction:
             # Be lenient - only flag if significantly incomplete
             active_angle = angles.left_elbow if self._active_arm == "left" else angles.right_elbow
             if self._active_arm == "both":
@@ -504,7 +471,6 @@ class BicepCurlModule(BaseExercise):
         super().reset()
         self._lowest_elbow_angle = 180.0
         self._highest_elbow_angle = 0.0
-        self._in_curl = False
         self._initial_shoulder_x = None
         self._initial_shoulder_y = None
         self._active_arm = None
@@ -550,17 +516,17 @@ class AlternateBicepCurlModule(BicepCurlModule):
         self._max_frames_between_switch: int = 60  # ~2 seconds at 30fps
         
         # Create separate rep counters for each arm
-        from utils.rep_counter import HysteresisRepCounter
+        from pipeline.rep_counter import HysteresisRepCounter
         self._left_rep_counter = HysteresisRepCounter(
-            upper_threshold=self.MAX_ELBOW_ANGLE - 10,
-            lower_threshold=self.MIN_ELBOW_ANGLE + 20,
-            min_rep_duration=0.5,
+            upper_threshold=self.REP_EXTENDED_THRESHOLD,
+            lower_threshold=self.REP_CONTRACTED_THRESHOLD,
+            min_rep_duration=0.2,
             max_rep_duration=8.0
         )
         self._right_rep_counter = HysteresisRepCounter(
-            upper_threshold=self.MAX_ELBOW_ANGLE - 10,
-            lower_threshold=self.MIN_ELBOW_ANGLE + 20,
-            min_rep_duration=0.5,
+            upper_threshold=self.REP_EXTENDED_THRESHOLD,
+            lower_threshold=self.REP_CONTRACTED_THRESHOLD,
+            min_rep_duration=0.2,
             max_rep_duration=8.0
         )
     
@@ -625,9 +591,10 @@ class AlternateBicepCurlModule(BicepCurlModule):
         return None
     
     def detect_rep_phase(self, landmarks: dict[JointName, Landmark]) -> str:
-        """Detect current phase for alternate bicep curls.
+        """Detect current phase for alternate bicep curls using per-arm rep counters.
         
-        Tracks each arm independently and switches focus when one arm completes.
+        Tracks each arm independently with separate rep counters and switches focus 
+        when one arm completes a full rep.
         """
         angles = self._calculate_angles(landmarks)
         self._frames_since_last_rep += 1
@@ -635,7 +602,7 @@ class AlternateBicepCurlModule(BicepCurlModule):
         # Detect which arm is actively curling
         curling_arm = self._detect_curling_arm(landmarks)
         
-        # Update both arm states
+        # Update both arm counters
         left_phase, left_completed = self._left_rep_counter.update(
             angles.left_elbow,
             left_angle=angles.left_elbow
@@ -645,7 +612,7 @@ class AlternateBicepCurlModule(BicepCurlModule):
             right_angle=angles.right_elbow
         )
         
-        # Track lowest angles for each arm
+        # Track lowest angles for each arm (for depth validation)
         self._left_lowest_angle = min(self._left_lowest_angle, angles.left_elbow)
         self._right_lowest_angle = min(self._right_lowest_angle, angles.right_elbow)
         
@@ -672,17 +639,17 @@ class AlternateBicepCurlModule(BicepCurlModule):
         self._left_in_curl = angles.left_elbow < self.MAX_ELBOW_ANGLE - 20
         self._right_in_curl = angles.right_elbow < self.MAX_ELBOW_ANGLE - 20
         
-        # Determine overall phase based on which arm is active
+        # Determine overall phase based on which arm is active and map to client-friendly phase
         if curling_arm == "left":
-            return left_phase.value if hasattr(left_phase, 'value') else str(left_phase)
+            return self._map_phase(left_phase.value)
         elif curling_arm == "right":
-            return right_phase.value if hasattr(right_phase, 'value') else str(right_phase)
+            return self._map_phase(right_phase.value)
         else:
             # Neither curling - use the expected arm's phase
             if self._current_arm == "left":
-                return left_phase.value if hasattr(left_phase, 'value') else str(left_phase)
+                return self._map_phase(left_phase.value)
             else:
-                return right_phase.value if hasattr(right_phase, 'value') else str(right_phase)
+                return self._map_phase(right_phase.value)
     
     def check_form(self, landmarks: dict[JointName, Landmark]) -> ExerciseResult:
         """Analyze alternate bicep curl form.

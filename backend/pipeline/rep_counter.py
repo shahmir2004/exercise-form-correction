@@ -72,6 +72,7 @@ class HysteresisRepCounter:
         self._form_violations: list[str] = []
         self._left_angle: float = 0.0
         self._right_angle: float = 0.0
+        self._has_seen_upper: bool = False
 
     def update(
         self,
@@ -93,15 +94,22 @@ class HysteresisRepCounter:
 
         current_time = time.time()
         rep_completed = False
+        if angle >= self.upper_threshold:
+            self._has_seen_upper = True
 
         if self._phase == RepPhase.IDLE:
-            # Accept any starting position to avoid getting stuck when the
-            # person begins mid-rep or at a non-extended angle.
+            # Start in READY - wait for user to reach extended position before counting down
             self._phase = RepPhase.READY
             self._rep_start_time = current_time
+            self._min_angle_in_rep = angle
+            self._max_angle_in_rep = angle
 
         elif self._phase == RepPhase.READY:
-            if angle < self.upper_threshold:
+            # READY: Waiting for the motion to start (angle must go down first)
+            # Only transition to ECCENTRIC if angle goes DOWN from upper threshold
+            if angle < self.upper_threshold and (
+                self._has_seen_upper or angle > self.lower_threshold
+            ):
                 self._phase = RepPhase.ECCENTRIC
                 self._rep_start_time = current_time
                 self._min_angle_in_rep = angle
@@ -109,10 +117,17 @@ class HysteresisRepCounter:
                 self._form_violations = []
 
         elif self._phase == RepPhase.ECCENTRIC:
+            # ECCENTRIC (down): Going from extended to contracted
+            # Transition to CONCENTRIC when reaching lower threshold
             if angle < self.lower_threshold:
                 self._phase = RepPhase.CONCENTRIC
+            # If we somehow go back up without reaching lower, go back to READY
+            elif angle > self.upper_threshold + 5:
+                self._phase = RepPhase.READY
 
         elif self._phase == RepPhase.CONCENTRIC:
+            # CONCENTRIC (up): Going from contracted back to extended
+            # Complete rep when returning to upper threshold
             if angle > self.upper_threshold:
                 rep_duration = current_time - (self._rep_start_time or current_time)
                 if self._is_valid_rep(rep_duration):
@@ -134,6 +149,7 @@ class HysteresisRepCounter:
                 self._rep_start_time = current_time
                 self._form_violations = []
 
+        # Timeout: If rep is taking too long, reset to READY
         if self._rep_start_time and (current_time - self._rep_start_time) > self.max_rep_duration:
             if self._phase in [RepPhase.ECCENTRIC, RepPhase.CONCENTRIC]:
                 self._phase = RepPhase.READY
@@ -149,7 +165,9 @@ class HysteresisRepCounter:
         if duration < self.min_rep_duration or duration > self.max_rep_duration:
             return False
         if self.require_full_extension:
-            if (self._max_angle_in_rep - self._min_angle_in_rep) < 30:
+            if self._max_angle_in_rep < self.upper_threshold:
+                return False
+            if self._min_angle_in_rep > self.lower_threshold:
                 return False
         return True
 
@@ -211,6 +229,7 @@ class HysteresisRepCounter:
         self._angle_history.clear()
         self._reps.clear()
         self._form_violations.clear()
+        self._has_seen_upper = False
 
 
 class ExerciseRepCounter:

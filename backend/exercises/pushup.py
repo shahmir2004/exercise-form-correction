@@ -26,7 +26,12 @@ class PushupModule(BaseExercise):
     def __init__(self):
         super().__init__()
         self._lowest_elbow_angle = 180.0
-        self._in_pushup = False
+        
+        # Create hysteresis-based rep counter for stable counting
+        self._create_rep_counter(
+            upper_threshold=self.MAX_ELBOW_ANGLE - 10,  # ~150 degrees (arms extended)
+            lower_threshold=self.MIN_ELBOW_ANGLE + 20   # ~90 degrees (bottom of push-up)
+        )
     
     @property
     def name(self) -> str:
@@ -150,7 +155,7 @@ class PushupModule(BaseExercise):
         return left_flare, right_flare
     
     def detect_rep_phase(self, landmarks: dict[JointName, Landmark]) -> str:
-        """Detect current phase of push-up repetition."""
+        """Detect current phase of push-up repetition using hysteresis rep counter."""
         angles = self._calculate_angles(landmarks)
         avg_elbow_angle = (angles.left_elbow + angles.right_elbow) / 2
         
@@ -159,27 +164,25 @@ class PushupModule(BaseExercise):
         if not is_horizontal:
             return "idle"
         
-        if avg_elbow_angle > self.MAX_ELBOW_ANGLE - 10:
-            # Top position (arms extended)
-            if self._in_pushup:
-                self._in_pushup = False
-                self._lowest_elbow_angle = 180.0
-                return "up"
-            return "idle"
-        elif avg_elbow_angle < self.MIN_ELBOW_ANGLE + 20:
-            # Bottom of push-up
-            self._in_pushup = True
+        # Use hysteresis-based rep counter for stable phase detection
+        if self._rep_counter:
+            phase_str, rep_completed = self.update_rep_counter(
+                angle=avg_elbow_angle,
+                left_angle=angles.left_elbow,
+                right_angle=angles.right_elbow
+            )
+            
+            # Track lowest angle for depth validation
             self._lowest_elbow_angle = min(self._lowest_elbow_angle, avg_elbow_angle)
-            return "hold"
-        else:
-            # Transitioning
-            if self._in_pushup:
-                if avg_elbow_angle > self._lowest_elbow_angle + 15:
-                    return "up"
-                return "down"
-            else:
-                self._in_pushup = True
-                return "down"
+            
+            if rep_completed:
+                # Reset tracking for next rep
+                self._lowest_elbow_angle = 180.0
+            
+            return phase_str
+        
+        # Fallback: Should not reach here if rep counter is properly initialized
+        return "idle"
     
     def check_form(self, landmarks: dict[JointName, Landmark]) -> ExerciseResult:
         """Analyze push-up form and return corrections."""
@@ -229,7 +232,7 @@ class PushupModule(BaseExercise):
         
         # Check depth
         avg_elbow_angle = (angles.left_elbow + angles.right_elbow) / 2
-        if self._in_pushup and self._lowest_elbow_angle > self.MIN_ELBOW_ANGLE + 10:
+        if self.current_phase in ("down", "up", "hold") and self._lowest_elbow_angle > self.MIN_ELBOW_ANGLE + 10:
             violations.append("Insufficient push-up depth")
             corrections.append("Lower your chest closer to the ground")
         

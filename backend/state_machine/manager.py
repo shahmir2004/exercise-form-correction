@@ -94,7 +94,9 @@ class FormManager:
         self._feature_extractor = FeatureExtractor()
         self._hmm = ExerciseHMM()
         self._embedder = embed_pose
-        self._knn = PoseKNNClassifier()
+        self._knn = PoseKNNClassifier(
+            min_embeddings_per_class=settings.MIN_CLASS_LIBRARY_EMBEDDINGS
+        )
         self._fusion = ClassifierFusion()
         self._form_evaluator = FormEvaluator()
         self._confidence_composer = ConfidenceComposer()
@@ -159,11 +161,30 @@ class FormManager:
         )
         candidate_source = fusion_result.source
 
-        # 4c. External classifier (ST-GCN) override if confident
+        # 4c. Exercise-first guard rules. These protect broad exercise
+        # detection from a sparse k-NN library or a curl-only external model.
+        candidate_exercise, candidate_variant, candidate_conf, candidate_source = (
+            self._apply_rule_gate(
+                frame,
+                candidate_exercise,
+                candidate_variant,
+                candidate_conf,
+                candidate_source,
+            )
+        )
+
+        # 4d. External classifier (ST-GCN) refines curl variants only.
         ext = self._parse_external_probs(client_probs)
-        if ext and ext[2] >= settings.EXTERNAL_CLASSIFIER_MIN_CONFIDENCE:
-            candidate_exercise, candidate_variant, candidate_conf = ext
-            candidate_source = "external"
+        candidate_exercise, candidate_variant, candidate_conf, candidate_source = (
+            self._apply_external_variant(
+                ext,
+                candidate_exercise,
+                candidate_variant,
+                candidate_conf,
+                candidate_source,
+                frame,
+            )
+        )
 
         # 5. Map HMM state to system state
         idle_posterior = float(hmm_result.posterior[ExState.IDLE])
@@ -279,6 +300,116 @@ class FormManager:
 
     def _is_safe_to_switch(self) -> bool:
         return self._last_rep_phase in ("idle", "ready")
+
+    def _apply_rule_gate(
+        self,
+        frame,
+        candidate_exercise: Optional[ExerciseType],
+        candidate_variant: Optional[str],
+        candidate_conf: float,
+        candidate_source: str,
+    ) -> tuple[Optional[ExerciseType], Optional[str], float, str]:
+        rule_exercise, rule_conf = self._rule_based_exercise(frame)
+        if rule_exercise is None:
+            return candidate_exercise, candidate_variant, candidate_conf, candidate_source
+
+        strong_gate = (
+            (rule_exercise == ExerciseType.PUSHUP and
+             rule_conf >= settings.PUSHUP_HORIZONTAL_MIN_CONFIDENCE)
+            or (rule_exercise == ExerciseType.SQUAT and
+                rule_conf >= settings.SQUAT_RULE_GATE_CONFIDENCE)
+            or (rule_exercise in (
+                ExerciseType.BICEP_CURL,
+                ExerciseType.ALTERNATE_BICEP_CURL,
+            ) and rule_conf >= settings.MIN_CONFIDENCE_FOR_REPS)
+        )
+
+        if candidate_exercise is None:
+            return rule_exercise, _EX_TYPE_TO_NAME.get(rule_exercise), rule_conf, "rule_gate"
+
+        if candidate_exercise == rule_exercise:
+            return (
+                candidate_exercise,
+                candidate_variant or _EX_TYPE_TO_NAME.get(candidate_exercise),
+                max(candidate_conf, rule_conf),
+                candidate_source,
+            )
+
+        if strong_gate and (
+            candidate_conf < rule_conf
+            or candidate_source in {"fusion_low_conf", "fusion_high_gap"}
+            or rule_exercise in (ExerciseType.PUSHUP, ExerciseType.SQUAT)
+        ):
+            return rule_exercise, _EX_TYPE_TO_NAME.get(rule_exercise), rule_conf, "rule_gate"
+
+        return candidate_exercise, candidate_variant, candidate_conf, candidate_source
+
+    def _rule_based_exercise(self, frame) -> tuple[Optional[ExerciseType], float]:
+        angles = frame.angles
+        left_knee = float(angles.get("left_knee", 180.0))
+        right_knee = float(angles.get("right_knee", 180.0))
+        left_elbow = float(angles.get("left_elbow", 180.0))
+        right_elbow = float(angles.get("right_elbow", 180.0))
+        torso = float(angles.get("torso_angle", 0.0))
+
+        min_knee = min(left_knee, right_knee)
+        avg_knee = (left_knee + right_knee) / 2.0
+        min_elbow = min(left_elbow, right_elbow)
+        avg_elbow = (left_elbow + right_elbow) / 2.0
+        elbow_asym = abs(left_elbow - right_elbow)
+
+        if frame.is_horizontal:
+            elbow_signal = 1.0 if min_elbow < 150.0 else 0.55
+            return ExerciseType.PUSHUP, min(0.98, 0.78 + 0.12 * elbow_signal)
+
+        squat_like = avg_knee < 135.0 and min_elbow > 135.0 and frame.hip_y > 0.55
+        if squat_like:
+            depth_score = min(1.0, max(0.0, (135.0 - avg_knee) / 55.0))
+            hip_score = min(1.0, max(0.0, (frame.hip_y - 0.55) / 0.20))
+            return ExerciseType.SQUAT, min(0.96, 0.70 + 0.16 * depth_score + 0.08 * hip_score)
+
+        curl_like = min_elbow < 145.0 and torso < 55.0
+        if curl_like:
+            if elbow_asym > 28.0 or frame.arm_phase_diff < -0.25:
+                return ExerciseType.ALTERNATE_BICEP_CURL, 0.74
+            return ExerciseType.BICEP_CURL, 0.70
+
+        return None, 0.0
+
+    def _apply_external_variant(
+        self,
+        ext: Optional[tuple[ExerciseType, str, float]],
+        candidate_exercise: Optional[ExerciseType],
+        candidate_variant: Optional[str],
+        candidate_conf: float,
+        candidate_source: str,
+        frame,
+    ) -> tuple[Optional[ExerciseType], Optional[str], float, str]:
+        if ext is None:
+            return candidate_exercise, candidate_variant, candidate_conf, candidate_source
+
+        ext_exercise, ext_variant, ext_conf = ext
+        if ext_conf < settings.CURL_VARIANT_OVERRIDE_CONFIDENCE:
+            return candidate_exercise, candidate_variant, candidate_conf, candidate_source
+
+        if ext_exercise not in (ExerciseType.BICEP_CURL, ExerciseType.ALTERNATE_BICEP_CURL):
+            return candidate_exercise, candidate_variant, candidate_conf, candidate_source
+
+        rule_exercise, _ = self._rule_based_exercise(frame)
+        candidate_is_curl = candidate_exercise in (
+            ExerciseType.BICEP_CURL,
+            ExerciseType.ALTERNATE_BICEP_CURL,
+            None,
+        )
+        rule_allows_curl = rule_exercise in (
+            ExerciseType.BICEP_CURL,
+            ExerciseType.ALTERNATE_BICEP_CURL,
+            None,
+        )
+        if not (candidate_is_curl and rule_allows_curl):
+            return candidate_exercise, candidate_variant, candidate_conf, candidate_source
+
+        return ext_exercise, ext_variant, max(candidate_conf, ext_conf), "external_variant"
 
     def _maybe_switch_exercise(
         self,

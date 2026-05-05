@@ -26,7 +26,6 @@ class SquatModule(BaseExercise):
     def __init__(self):
         super().__init__()
         self._lowest_knee_angle = 180.0
-        self._in_squat = False
         
         # Create hysteresis-based rep counter for stable counting
         self._create_rep_counter(
@@ -126,7 +125,7 @@ class SquatModule(BaseExercise):
         return left_valgus, right_valgus
     
     def detect_rep_phase(self, landmarks: dict[JointName, Landmark]) -> str:
-        """Detect current phase of squat repetition with hysteresis rep counter."""
+        """Detect current phase of squat repetition using hysteresis rep counter."""
         angles = self._calculate_angles(landmarks)
         avg_knee_angle = (angles.left_knee + angles.right_knee) / 2
         
@@ -141,38 +140,14 @@ class SquatModule(BaseExercise):
             # Track lowest angle for depth validation
             self._lowest_knee_angle = min(self._lowest_knee_angle, avg_knee_angle)
             
-            # Update internal state to match counter
-            if phase_str in ["up", "down", "hold"]:
-                self._in_squat = phase_str in ["down", "hold"]
-            
             if rep_completed:
                 # Reset tracking for next rep
                 self._lowest_knee_angle = 180.0
             
             return phase_str
         
-        # Fallback to legacy detection if counter not available
-        if avg_knee_angle > self.MAX_KNEE_ANGLE - 10:
-            # Standing position
-            if self._in_squat:
-                self._in_squat = False
-                self._lowest_knee_angle = 180.0
-                return "up"
-            return "idle"
-        elif avg_knee_angle < self.MIN_KNEE_ANGLE + 20:
-            # Bottom of squat
-            self._in_squat = True
-            self._lowest_knee_angle = min(self._lowest_knee_angle, avg_knee_angle)
-            return "hold"
-        else:
-            # Transitioning
-            if self._in_squat:
-                if avg_knee_angle > self._lowest_knee_angle + 15:
-                    return "up"
-                return "down"
-            else:
-                self._in_squat = True
-                return "down"
+        # Fallback: Should not reach here if rep counter is properly initialized
+        return "idle"
     
     def check_form(self, landmarks: dict[JointName, Landmark]) -> ExerciseResult:
         """Analyze squat form and return corrections."""
@@ -191,7 +166,7 @@ class SquatModule(BaseExercise):
         is_valid = True
         
         # Check depth (only relevant when in squat position)
-        if self._in_squat and self._lowest_knee_angle > self.MIN_KNEE_ANGLE + 10:
+        if self.current_phase in ("down", "up", "hold") and self._lowest_knee_angle > self.MIN_KNEE_ANGLE + 10:
             violations.append("Insufficient squat depth")
             corrections.append("Lower your hips until thighs are parallel to ground")
             # Don't mark as invalid yet - they might go deeper

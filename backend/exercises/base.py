@@ -6,7 +6,7 @@ from enum import Enum
 from typing import Optional
 import numpy as np
 
-from utils.rep_counter import HysteresisRepCounter, RepPhase, RepQuality
+from pipeline.rep_counter import HysteresisRepCounter, RepPhase, RepQuality
 
 
 class ExerciseType(str, Enum):
@@ -173,6 +173,17 @@ def landmarks_to_dict(landmarks: list[dict]) -> dict[JointName, Landmark]:
 
 class BaseExercise(ABC):
     """Abstract base class for exercise correction modules."""
+
+    # Convert mechanical rep-counter phases to client-facing exercise phases.
+    # Subclasses override this when joint angle direction has different meaning.
+    PHASE_MAP = {
+        "idle": "idle",
+        "ready": "ready",
+        "down": "down",
+        "up": "up",
+        "hold": "hold",
+        "transition": "transition"
+    }
     
     def __init__(self):
         self.rep_count = 0
@@ -197,6 +208,10 @@ class BaseExercise(ABC):
         )
         return self._rep_counter
     
+    def _map_phase(self, counter_phase: str) -> str:
+        """Map rep counter phase to client-friendly phase."""
+        return self.PHASE_MAP.get(counter_phase, "idle")
+    
     def update_rep_counter(
         self, 
         angle: float, 
@@ -220,7 +235,7 @@ class BaseExercise(ABC):
         if rep_completed:
             self.rep_count = self._rep_counter.rep_count
         
-        return phase.value, rep_completed
+        return self._map_phase(phase.value), rep_completed
     
     @property
     def rep_quality(self) -> Optional[float]:
@@ -308,6 +323,7 @@ class BaseExercise(ABC):
         
         # Detect rep phase (may update self.rep_count internally via _rep_counter)
         current_phase = self.detect_rep_phase(landmark_dict)
+        self.current_phase = current_phase
 
         self._phase_history.append(current_phase)
         if len(self._phase_history) > 30:

@@ -2,7 +2,8 @@
 
 import os
 from typing import Optional, List
-from pydantic_settings import BaseSettings
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 def get_cors_origins() -> List[str]:
@@ -24,6 +25,7 @@ def get_cors_origins() -> List[str]:
 
 class Settings(BaseSettings):
     """Application configuration settings."""
+    model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
     
     # Server settings
     HOST: str = "0.0.0.0"
@@ -49,6 +51,10 @@ class Settings(BaseSettings):
     EXERCISE_SWITCH_CONFIDENCE: float = 0.6
     # External classifier (ST-GCN) integration
     EXTERNAL_CLASSIFIER_MIN_CONFIDENCE: float = 0.7
+    CURL_VARIANT_OVERRIDE_CONFIDENCE: float = 0.7
+    SQUAT_RULE_GATE_CONFIDENCE: float = 0.72
+    PUSHUP_HORIZONTAL_MIN_CONFIDENCE: float = 0.78
+    MIN_CLASS_LIBRARY_EMBEDDINGS: int = 1
     BLOCK_SWITCH_ON_UNRELIABLE: bool = True
     
     # Supabase settings (disabled for MVP)
@@ -89,9 +95,17 @@ class Settings(BaseSettings):
         """Get CORS origins from environment."""
         return get_cors_origins()
     
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
+    @field_validator("DEBUG", mode="before")
+    @classmethod
+    def parse_debug(cls, value):
+        """Accept deployment env labels commonly used for non-debug builds."""
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"release", "production", "prod"}:
+                return False
+            if normalized in {"debug", "development", "dev"}:
+                return True
+        return value
 
 
 settings = Settings()

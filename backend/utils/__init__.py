@@ -1,6 +1,6 @@
 """Utility modules for exercise detection."""
 
-from .rep_counter import (
+from pipeline.rep_counter import (
     RepPhase,
     RepQuality,
     RepData,

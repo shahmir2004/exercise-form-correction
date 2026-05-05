@@ -548,7 +548,7 @@ WS /api/ws/pose/{client_id}
 }
 ```
 
-`client_probs` is **optional**. If omitted, the backend classifies using HMM + k-NN alone. If present, the probabilities are used to assist the fusion decision for bicep curl variant detection.
+`client_probs` is **optional**. If omitted, the backend classifies using HMM + k-NN alone. If present, the probabilities refine curl variants only; squat and push-up detection remain guarded by backend pose rules.
 
 **Receive (Server → Client) — per frame:**
 ```json
@@ -566,7 +566,9 @@ WS /api/ws/pose/{client_id}
   "confidence": 0.88,
   "exercise_confidence": 0.91,
   "form_confidence": 0.88,
-  "signal_quality": "good"
+  "signal_quality": "good",
+  "exercise_variant": "curl-stand",
+  "exercise_source": "external_variant"
 }
 ```
 
@@ -583,6 +585,8 @@ WS /api/ws/pose/{client_id}
 | `exercise_confidence` | float 0–1 | Fusion classifier confidence |
 | `form_confidence` | float 0–1 | Kalman-uncertainty-weighted joint quality |
 | `signal_quality` | string | Overall pose signal quality |
+| `exercise_variant` | string \| null | Variant label, e.g. `curl-stand` or `alt-seat` |
+| `exercise_source` | string | Decision source, e.g. `rule_gate`, `fusion_agree`, or `external_variant` |
 
 ### REST Endpoints
 
@@ -590,8 +594,10 @@ WS /api/ws/pose/{client_id}
 |--------|------|-------------|
 | `GET` | `/api/health` | `{"status":"healthy","connections":N}` |
 | `POST` | `/api/reset/{client_id}` | Reset session state |
-| `GET` | `/api/pose-library/{exercise}` | List reference poses for k-NN |
-| `POST` | `/api/pose-library/{exercise}` | Add reference pose to k-NN library |
+| `GET` | `/api/pose-library` | List k-NN reference libraries |
+| `GET` | `/api/pose-library/{exercise}` | Download a reference library |
+| `POST` | `/api/pose-library/record` | Save captured pose frames as k-NN embeddings |
+| `DELETE` | `/api/pose-library/{exercise}` | Delete a reference library |
 | `POST` | `/api/upload/init` | Init chunked upload |
 | `POST` | `/api/upload/chunk/{upload_id}` | Upload chunk |
 | `GET` | `/api/upload/status/{upload_id}` | Upload progress |
@@ -616,6 +622,10 @@ All parameters are tunable via environment variables (see `backend/config/settin
 | `VIOLATION_AGG_N` | `6` | M-of-N: window size (frames) |
 | `VIOLATION_COOLDOWN_FRAMES` | `15` | Frames before same violation can emit again |
 | `MAX_FRAMES_PER_SECOND` | `60` | Rate limit for WebSocket frames |
+| `MIN_CLASS_LIBRARY_EMBEDDINGS` | `1` | Minimum embeddings required for a k-NN class to vote |
+| `PUSHUP_HORIZONTAL_MIN_CONFIDENCE` | `0.78` | Rule-gate confidence for horizontal push-up detection |
+| `SQUAT_RULE_GATE_CONFIDENCE` | `0.72` | Rule-gate confidence for squat detection |
+| `CURL_VARIANT_OVERRIDE_CONFIDENCE` | `0.7` | Minimum ST-GCN confidence to refine curl variants |
 
 ---
 
