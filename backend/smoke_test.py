@@ -63,30 +63,58 @@ def squat_pose(depth: float) -> list[dict]:
     return _make_landmarks(pose)
 
 
+def _wrist_for_elbow_angle(
+    shoulder: tuple[float, float],
+    elbow: tuple[float, float],
+    target_angle_deg: float,
+    forearm_len: float = 0.18,
+    *,
+    side: int = +1,
+) -> tuple[float, float]:
+    """
+    Place the wrist so that the elbow angle (shoulder–elbow–wrist) equals
+    `target_angle_deg`. `side` selects which of the two valid wrist positions
+    to take (+1 swings the wrist outward, -1 swings inward).
+    """
+    sx, sy = shoulder[0] - elbow[0], shoulder[1] - elbow[1]
+    s_angle = math.atan2(sy, sx)
+    wrist_angle = s_angle - side * math.radians(target_angle_deg)
+    return (
+        elbow[0] + forearm_len * math.cos(wrist_angle),
+        elbow[1] + forearm_len * math.sin(wrist_angle),
+    )
+
+
 def alt_curl_pose(t: float) -> list[dict]:
     """
     Synthetic alternate bicep curl. t ∈ [0, 1] is phase within rep cycle.
-    Left arm flexes during t=[0, 0.5] (elbow 160→60°), then extends.
-    Right arm does the opposite (60→160°).
-    """
-    # Left elbow angle goes 160 → 60 → 160 over t ∈ [0,1]
-    left_angle = 160 - 100 * (1 - abs(2 * t - 1))
-    right_angle = 60 + 100 * (1 - abs(2 * t - 1))
+    Left arm flexes during t=[0, 0.5] (elbow 165→55°), then extends.
+    Right arm does the opposite (55→165°).
 
-    # We don't actually need to compute the angle — we'll set wrist Y based on elbow angle.
-    # Standing pose; elbow at side; wrist closer to shoulder when curled.
-    def wrist_y_from_angle(angle_deg: float) -> float:
-        # angle 160 = arm straight down, wrist at 0.85
-        # angle 60  = curled, wrist at 0.55
-        return 0.55 + (angle_deg - 60) / 100 * 0.30
+    Uses real trigonometry to place wrists so the computed elbow angle
+    matches the target — required after the bicep ROM tightening to
+    160°/60° in the rep counter.
+    """
+    # Sweep wide enough that the BicepCurlModule's 5-frame angle smoothing
+    # still registers below the 60°/above 160° rep counter thresholds.
+    left_angle = 175 - 135 * (1 - abs(2 * t - 1))   # 175° → 40° → 175°
+    right_angle = 40 + 135 * (1 - abs(2 * t - 1))   # 40° → 175° → 40°
+
+    left_shoulder = (0.40, 0.40)
+    right_shoulder = (0.60, 0.40)
+    left_elbow = (0.38, 0.55)
+    right_elbow = (0.62, 0.55)
+
+    lwx, lwy = _wrist_for_elbow_angle(left_shoulder, left_elbow, left_angle, side=-1)
+    rwx, rwy = _wrist_for_elbow_angle(right_shoulder, right_elbow, right_angle, side=+1)
 
     pose = {
-        11: (0.40, 0.40, 0.0),
-        12: (0.60, 0.40, 0.0),
-        13: (0.38, 0.55, 0.0),
-        14: (0.62, 0.55, 0.0),
-        15: (0.40, wrist_y_from_angle(left_angle), 0.0),
-        16: (0.60, wrist_y_from_angle(right_angle), 0.0),
+        11: (left_shoulder[0], left_shoulder[1], 0.0),
+        12: (right_shoulder[0], right_shoulder[1], 0.0),
+        13: (left_elbow[0], left_elbow[1], 0.0),
+        14: (right_elbow[0], right_elbow[1], 0.0),
+        15: (lwx, lwy, 0.0),
+        16: (rwx, rwy, 0.0),
         23: (0.45, 0.62, 0.0),
         24: (0.55, 0.62, 0.0),
         25: (0.45, 0.80, 0.0),
@@ -98,12 +126,13 @@ def alt_curl_pose(t: float) -> list[dict]:
 
 
 def run_squat_test() -> None:
-    print("\n=== Squat test (5 reps) ===")
+    print("\n=== Squat test (6 cycles, expect 5+ reps) ===")
     m = FormManager()
     last_rep = 0
     last_ex = None
-    for rep in range(5):
-        for f in range(30):
+    # First cycle is consumed by HMM lock-in; expect ~(N-1) reps from N cycles.
+    for rep in range(6):
+        for f in range(31):  # inclusive — ensure depth returns fully to 0
             depth = abs(2 * f / 30 - 1)
             depth = 1 - depth
             time.sleep(_FRAME_INTERVAL)
@@ -126,7 +155,10 @@ def run_alt_curl_test() -> tuple[int, int]:
     bad_flips = 0
     last_label = None
     for rep in range(5):
-        for f in range(40):
+        # Iterate inclusive of the cycle endpoint so the elbow angle actually
+        # crosses the upper rep threshold (160°) — needed since the new
+        # bicep curl ROM gate requires true full extension.
+        for f in range(41):
             t = f / 40.0
             time.sleep(_FRAME_INTERVAL)
             r = m.process_frame(alt_curl_pose(t))
