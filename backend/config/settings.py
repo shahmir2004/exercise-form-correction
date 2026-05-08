@@ -51,6 +51,17 @@ class Settings(BaseSettings):
     # Stationary detection (motion variance over rolling window)
     STATIONARY_WINDOW_FRAMES: int = 30
     STATIONARY_THRESHOLD: float = 0.015  # Normalized image-space delta
+
+    # Detailed per-frame detection logging. Set DETECTION_DEBUG_LOG=true to
+    # emit one DEBUG line per frame (HMM posterior, EMAs, candidate, state).
+    # Transition events (state change, exercise switch, rep completed) are
+    # always logged at INFO regardless of this flag.
+    DETECTION_DEBUG_LOG: bool = False
+    # Confidence floor below which an active exercise module is dropped.
+    # Above this floor we keep showing the detected exercise even during
+    # symmetric crossover frames in alternating-arm exercises so the UI
+    # doesn't flicker back to "Detecting…".
+    DETECTION_STICKY_FLOOR: float = 0.3
     
     # Supabase settings (disabled for MVP)
     SUPABASE_ENABLED: bool = False

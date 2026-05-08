@@ -181,10 +181,16 @@ class ExerciseHMM:
     _ELBOW_EMA_DECAY = 0.8
     # Threshold above which ALT_CURL gets a self-bias bonus on the next frame.
     _ALT_CURL_HOLD_THRESHOLD = 0.4
-    # Log-emission bonus added to ALT_CURL when its previous-frame posterior
-    # exceeded the hold threshold. Equivalent to a stronger self-loop for
-    # ALT_CURL only — narrow fix, doesn't make other states stickier.
+    # Log-emission bonus added to ALT_CURL when the slow-decay memory exceeds
+    # the hold threshold. Equivalent to a stronger self-loop for ALT_CURL
+    # only — narrow fix, doesn't make other states stickier.
     _ALT_CURL_HOLD_BONUS = 1.0
+    # Slow-decay memory of recent ALT_CURL posterior. 0.97 ≈ 50-frame half-
+    # life (~2.5s @ 20fps) so the hold bias survives the multi-second
+    # one-arm-at-a-time transition where arm_phase_diff briefly collapses
+    # to zero (only one arm moving). Without this, alt-curl detection
+    # vanishes when the user lowers a weight on one arm.
+    _ALT_CURL_MEM_DECAY = 0.97
 
     def __init__(self, config: Optional[HMMConfig] = None):
         self.config = config or HMMConfig()
@@ -196,6 +202,8 @@ class ExerciseHMM:
         self._arm_asym_ema: float = 0.0
         self._elbow_flex_ema: float = 0.0
         self._prev_alt_curl_post: float = 0.0
+        # Peak-tracking slow decay over recent ALT_CURL posterior.
+        self._alt_curl_memory: float = 0.0
 
     def _log_emission(self, state: int, obs: np.ndarray) -> float:
         """Log probability of obs given state (Gaussian)."""
@@ -212,11 +220,11 @@ class ExerciseHMM:
             # to keep ALT_CURL alive across crossover frames.
             log_p += 4.0 * arm_asym + 1.5 * elbow_flex * arm_asym
             log_p += 2.5 * max(0.0, -phase_diff)  # rewards phase_diff < 0
-            # Self-bias hysteresis: once ALT_CURL has been confidently detected,
-            # add a constant bonus next frame so symmetric crossover frames
-            # don't unseat it. Decays as posterior decays.
-            if self._prev_alt_curl_post > self._ALT_CURL_HOLD_THRESHOLD:
-                log_p += self._ALT_CURL_HOLD_BONUS
+            # Self-bias hysteresis based on slow-decay memory of recent
+            # ALT_CURL posterior. Survives multi-frame collapses (e.g. when
+            # one arm holds while the other lowers, killing arm_phase_diff).
+            if self._alt_curl_memory > self._ALT_CURL_HOLD_THRESHOLD:
+                log_p += self._ALT_CURL_HOLD_BONUS * min(1.0, self._alt_curl_memory)
         elif state == ExState.CURL:
             # Both standing and seated curls: reward elbow flexion + in-phase
             log_p += 2.0 * elbow_flex
@@ -273,8 +281,16 @@ class ExerciseHMM:
         posterior = np.clip(posterior, 0.0, 1.0)
         posterior /= posterior.sum()
 
-        # Cache ALT_CURL posterior for next-frame self-bias.
-        self._prev_alt_curl_post = float(posterior[ExState.ALT_CURL])
+        # Cache ALT_CURL posterior for next-frame self-bias and update the
+        # slow-decay memory. Memory tracks the running maximum decayed at
+        # _ALT_CURL_MEM_DECAY per frame, so a confident detection earlier
+        # propagates forward even when the current posterior collapses.
+        alt_post_now = float(posterior[ExState.ALT_CURL])
+        self._prev_alt_curl_post = alt_post_now
+        self._alt_curl_memory = max(
+            alt_post_now,
+            self._ALT_CURL_MEM_DECAY * self._alt_curl_memory,
+        )
 
         # Most likely state
         ml_state = ExState(int(np.argmax(posterior)))
@@ -301,3 +317,4 @@ class ExerciseHMM:
         self._arm_asym_ema = 0.0
         self._elbow_flex_ema = 0.0
         self._prev_alt_curl_post = 0.0
+        self._alt_curl_memory = 0.0

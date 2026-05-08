@@ -1,5 +1,6 @@
 """Form Manager — thin orchestrator over HMM + rule-gated pipeline."""
 
+import logging
 import time
 import numpy as np
 from enum import Enum
@@ -19,6 +20,11 @@ from pipeline.hmm import ExerciseHMM, ExState
 from pipeline.motion_detector import MotionDetector
 from pipeline.form_evaluator import FormEvaluator, Violation
 from pipeline.confidence import ConfidenceComposer
+
+
+_logger = logging.getLogger("detect")
+# Per-frame DEBUG logs are noisy (~20/sec). Gate on settings.DETECTION_DEBUG_LOG.
+# Transition events are always emitted at INFO so production logs show them.
 
 
 class SystemState(str, Enum):
@@ -101,6 +107,7 @@ class FormManager:
         self._frames_processed = 0
         self._last_result: Optional[ExerciseResult] = None
         self._last_rep_phase: str = "idle"
+        self._last_rep_count: int = 0
         self._current_variant: Optional[str] = None
         self._exercise_source: str = "hmm"
         self._pending_exercise: Optional[ExerciseType] = None
@@ -169,7 +176,39 @@ class FormManager:
             elif candidate_conf >= 0.3 and new_sys_state == SystemState.IDLE:
                 new_sys_state = SystemState.SCANNING
 
+        # Sticky ACTIVE state: while a module is already running and the user
+        # is moving, keep ACTIVE during signal dips (e.g. the symmetric
+        # crossover frame in alternating bicep curls when both arms briefly
+        # show similar elbow flexion). Only fall to SCANNING on true signal
+        # collapse below DETECTION_STICKY_FLOOR.
+        if (
+            self._active_module is not None
+            and not self._is_stationary
+            and new_sys_state in (SystemState.SCANNING, SystemState.IDLE)
+            and max(max_non_idle, candidate_conf) >= settings.DETECTION_STICKY_FLOOR
+        ):
+            sticky_reason = (
+                f"sticky-active (max_non_idle={max_non_idle:.2f}, "
+                f"candidate_conf={candidate_conf:.2f}, floor={settings.DETECTION_STICKY_FLOOR})"
+            )
+            new_sys_state = SystemState.ACTIVE
+        else:
+            sticky_reason = None
+
         if new_sys_state != self._state:
+            _logger.info(
+                "state %s -> %s (frame=%d, idle_post=%.2f, max_non_idle=%.2f, "
+                "candidate=%s, candidate_conf=%.2f, stationary=%s%s)",
+                self._state.value,
+                new_sys_state.value,
+                self._frames_processed,
+                idle_posterior,
+                max_non_idle,
+                candidate_exercise.value if candidate_exercise else "none",
+                candidate_conf,
+                self._is_stationary,
+                f", {sticky_reason}" if sticky_reason else "",
+            )
             self._state = new_sys_state
             self._state_start_time = time.time()
             if new_sys_state == SystemState.IDLE:
@@ -194,11 +233,50 @@ class FormManager:
         if self._active_module is not None:
             self._last_result = self._active_module.process_frame(landmarks)
             if self._last_result is not None:
+                # Log rep_count increments at INFO so they show up in prod logs.
+                rc = self._last_result.rep_count
+                if rc > self._last_rep_count:
+                    _logger.info(
+                        "rep %d completed (%s, valid=%s, phase=%s, violations=%s)",
+                        rc,
+                        _EX_TYPE_TO_NAME.get(self._current_exercise, "?"),
+                        self._last_result.is_valid,
+                        self._last_result.rep_phase,
+                        self._last_result.violations or [],
+                    )
+                    self._last_rep_count = rc
                 self._last_rep_phase = self._last_result.rep_phase
 
         # 10. Form evaluation (pipeline-based, temporally stable)
         ex_name = _EX_TYPE_TO_NAME.get(self._current_exercise)
         stable_violations = self._form_evaluator.evaluate(frame, ex_name)
+
+        # Per-frame DEBUG log — gated to avoid log spam in production.
+        if settings.DETECTION_DEBUG_LOG:
+            posterior = hmm_result.posterior
+            _logger.debug(
+                "f=%d state=%s active=%s cand=%s conf=%.2f src=%s "
+                "post=[idle:%.2f sq:%.2f pu:%.2f curl:%.2f alt:%.2f] "
+                "asym_ema=%.2f elbow_ema=%.2f phase_diff=%.2f "
+                "stationary=%s phase=%s reps=%d",
+                self._frames_processed,
+                self._state.value,
+                _EX_TYPE_TO_NAME.get(self._current_exercise, "none"),
+                candidate_exercise.value if candidate_exercise else "none",
+                candidate_conf,
+                candidate_source,
+                float(posterior[ExState.IDLE]),
+                float(posterior[ExState.SQUAT]),
+                float(posterior[ExState.PUSHUP]),
+                float(posterior[ExState.CURL]),
+                float(posterior[ExState.ALT_CURL]),
+                float(self._hmm._arm_asym_ema),
+                float(self._hmm._elbow_flex_ema),
+                float(frame.arm_phase_diff),
+                self._is_stationary,
+                self._last_rep_phase,
+                self._last_rep_count,
+            )
 
         if self._last_result is not None and stable_violations is not None:
             self._last_result.violations = [v.message for v in stable_violations]
@@ -231,10 +309,19 @@ class FormManager:
             return
         module_class = _EXERCISE_MODULES.get(exercise_type)
         if module_class:
+            previous = self._current_exercise.value if self._current_exercise else "none"
             self._active_module = module_class()
             self._current_exercise = exercise_type
             self._current_variant = _EX_TYPE_TO_NAME.get(exercise_type)
             self._exercise_source = source
+            self._last_rep_count = 0
+            _logger.info(
+                "exercise %s -> %s (source=%s, frame=%d)",
+                previous,
+                exercise_type.value,
+                source,
+                self._frames_processed,
+            )
 
     def _reset_pending(self) -> None:
         self._pending_exercise = None
@@ -417,6 +504,9 @@ class FormManager:
         return f"Activity: {self.get_exercise_name()}"
 
     def reset(self) -> None:
+        _logger.info("session reset (was state=%s, exercise=%s)",
+                     self._state.value,
+                     self._current_exercise.value if self._current_exercise else "none")
         self._state = SystemState.IDLE
         self._current_exercise = None
         self._active_module = None
@@ -429,6 +519,7 @@ class FormManager:
         self._frames_processed = 0
         self._last_result = None
         self._last_rep_phase = "idle"
+        self._last_rep_count = 0
         self._is_stationary = False
         self._validator.reset()
         self._kalman.reset()

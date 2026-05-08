@@ -1,5 +1,7 @@
 """FastAPI application entry point."""
 
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -8,6 +10,23 @@ from pathlib import Path
 from config.settings import settings
 from api.routes import router as api_router
 from api.upload import router as upload_router
+
+
+# Configure detection logging.
+# - 'detect' logger emits INFO events (state transitions, exercise switches,
+#   reps, sessions) always — these surface in Render's runtime logs.
+# - DEBUG per-frame lines only when DETECTION_DEBUG_LOG=true.
+_handler = logging.StreamHandler()
+_handler.setFormatter(logging.Formatter(
+    "%(asctime)s [%(name)s] %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+))
+_detect_logger = logging.getLogger("detect")
+_detect_logger.handlers = [_handler]
+_detect_logger.setLevel(
+    logging.DEBUG if settings.DETECTION_DEBUG_LOG else logging.INFO
+)
+_detect_logger.propagate = False
 
 
 # Create FastAPI app
