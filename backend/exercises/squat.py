@@ -13,13 +13,23 @@ from .base import (
 
 class SquatModule(BaseExercise):
     """Squat exercise detection and form correction."""
-    
+
+    # Mechanical→semantic mapping is identity for squat: angle decreasing
+    # = lowering body = eccentric phase of the lift.
+    PHASE_DISPLAY = {
+        "idle": "",
+        "setup": "Standing",
+        "eccentric": "Lowering down",
+        "concentric": "Driving up",
+        "hold": "At depth",
+    }
+
     # Form thresholds
     MIN_KNEE_ANGLE = 70  # Minimum knee bend for valid squat depth
     MAX_KNEE_ANGLE = 160  # Standing position
     KNEE_VALGUS_THRESHOLD = 0.03  # Normalized X difference threshold
     BACK_ANGLE_THRESHOLD = 45  # Maximum forward lean angle
-    
+
     # Hysteresis thresholds
     ANGLE_HYSTERESIS = 12  # Degrees of buffer to prevent flickering
     
@@ -131,10 +141,17 @@ class SquatModule(BaseExercise):
         
         # Use hysteresis-based rep counter for stable phase detection
         if self._rep_counter:
+            knee_vis = min(
+                landmarks[JointName.LEFT_KNEE].visibility,
+                landmarks[JointName.RIGHT_KNEE].visibility,
+                landmarks[JointName.LEFT_HIP].visibility,
+                landmarks[JointName.RIGHT_HIP].visibility,
+            )
             phase_str, rep_completed = self.update_rep_counter(
                 angle=avg_knee_angle,
                 left_angle=angles.left_knee,
-                right_angle=angles.right_knee
+                right_angle=angles.right_knee,
+                visibility=knee_vis,
             )
             
             # Track lowest angle for depth validation
@@ -166,7 +183,7 @@ class SquatModule(BaseExercise):
         is_valid = True
         
         # Check depth (only relevant when in squat position)
-        if self.current_phase in ("down", "up", "hold") and self._lowest_knee_angle > self.MIN_KNEE_ANGLE + 10:
+        if self.current_phase in ("eccentric", "concentric", "hold") and self._lowest_knee_angle > self.MIN_KNEE_ANGLE + 10:
             violations.append("Insufficient squat depth")
             corrections.append("Lower your hips until thighs are parallel to ground")
             # Don't mark as invalid yet - they might go deeper
@@ -220,4 +237,4 @@ class SquatModule(BaseExercise):
     
     def _is_rep_complete(self, last_phase: str, current_phase: str) -> bool:
         """Rep complete when returning to standing from squat."""
-        return last_phase == "up" and current_phase == "idle"
+        return last_phase == "concentric" and current_phase in ("setup", "idle")

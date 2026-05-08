@@ -14,7 +14,17 @@ from .base import (
 
 class PushupModule(BaseExercise):
     """Push-up exercise detection and form correction."""
-    
+
+    # Mechanical→semantic mapping is identity for pushup: angle decreasing
+    # = lowering body = eccentric phase of the lift.
+    PHASE_DISPLAY = {
+        "idle": "",
+        "setup": "Plank",
+        "eccentric": "Lowering",
+        "concentric": "Pressing up",
+        "hold": "At bottom",
+    }
+
     # Form thresholds
     MIN_ELBOW_ANGLE = 70  # Bottom of push-up
     MAX_ELBOW_ANGLE = 160  # Top of push-up (arms extended)
@@ -166,10 +176,17 @@ class PushupModule(BaseExercise):
         
         # Use hysteresis-based rep counter for stable phase detection
         if self._rep_counter:
+            elbow_vis = min(
+                landmarks[JointName.LEFT_ELBOW].visibility,
+                landmarks[JointName.RIGHT_ELBOW].visibility,
+                landmarks[JointName.LEFT_SHOULDER].visibility,
+                landmarks[JointName.RIGHT_SHOULDER].visibility,
+            )
             phase_str, rep_completed = self.update_rep_counter(
                 angle=avg_elbow_angle,
                 left_angle=angles.left_elbow,
-                right_angle=angles.right_elbow
+                right_angle=angles.right_elbow,
+                visibility=elbow_vis,
             )
             
             # Track lowest angle for depth validation
@@ -232,7 +249,7 @@ class PushupModule(BaseExercise):
         
         # Check depth
         avg_elbow_angle = (angles.left_elbow + angles.right_elbow) / 2
-        if self.current_phase in ("down", "up", "hold") and self._lowest_elbow_angle > self.MIN_ELBOW_ANGLE + 10:
+        if self.current_phase in ("eccentric", "concentric", "hold") and self._lowest_elbow_angle > self.MIN_ELBOW_ANGLE + 10:
             violations.append("Insufficient push-up depth")
             corrections.append("Lower your chest closer to the ground")
         
@@ -263,4 +280,4 @@ class PushupModule(BaseExercise):
     
     def _is_rep_complete(self, last_phase: str, current_phase: str) -> bool:
         """Rep complete when returning to top position from bottom."""
-        return last_phase == "up" and (current_phase == "idle" or current_phase == "down")
+        return last_phase == "concentric" and current_phase in ("setup", "idle")

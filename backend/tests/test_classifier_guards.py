@@ -1,8 +1,10 @@
+"""Tests for the rule-gate safety net layered on top of HMM classification."""
+
 import numpy as np
+import pytest
 
 from exercises.base import ExerciseType
 from pipeline.features import BodyFrame, ViewEstimate
-from pipeline.knn_classifier import PoseKNNClassifier, REQUIRED_EXERCISE_LABELS
 from state_machine.manager import FormManager
 
 
@@ -34,16 +36,14 @@ def test_pushup_rule_gate_overrides_bad_curl_candidate():
         hip_y=0.5,
     )
 
-    exercise, variant, confidence, source = manager._apply_rule_gate(
+    exercise, confidence, source = manager._apply_rule_gate(
         pushup_frame,
         ExerciseType.BICEP_CURL,
-        "bicep_curl",
         0.62,
-        "fusion_high_gap",
+        "hmm",
     )
 
     assert exercise == ExerciseType.PUSHUP
-    assert variant == "pushup"
     assert confidence >= 0.78
     assert source == "rule_gate"
 
@@ -62,67 +62,50 @@ def test_squat_rule_gate_overrides_missing_library_curl_bias():
         hip_y=0.72,
     )
 
-    exercise, variant, confidence, source = manager._apply_rule_gate(
+    exercise, confidence, source = manager._apply_rule_gate(
         squat_frame,
         ExerciseType.BICEP_CURL,
-        "bicep_curl",
         0.55,
-        "fusion_high_gap",
+        "hmm",
     )
 
     assert exercise == ExerciseType.SQUAT
-    assert variant == "squat"
     assert confidence >= 0.72
     assert source == "rule_gate"
 
 
-def test_external_stgcn_refines_curl_variant_but_not_pushup():
+def test_rule_gate_agrees_with_hmm_boosts_confidence():
     manager = FormManager()
-    pushup_frame = _frame(
-        {"left_elbow": 90, "right_elbow": 92, "left_knee": 170, "right_knee": 170},
-        is_horizontal=True,
-    )
-
-    result = manager._apply_external_variant(
-        (ExerciseType.BICEP_CURL, "curl-stand", 0.95),
-        ExerciseType.PUSHUP,
-        "pushup",
-        0.8,
-        "rule_gate",
-        pushup_frame,
-    )
-
-    assert result == (ExerciseType.PUSHUP, "pushup", 0.8, "rule_gate")
-
-
-def test_external_stgcn_can_choose_alternate_curl_variant_when_curl_like():
-    manager = FormManager()
-    curl_frame = _frame(
+    squat_frame = _frame(
         {
-            "left_elbow": 70,
-            "right_elbow": 140,
-            "left_knee": 170,
-            "right_knee": 170,
-            "torso_angle": 10,
+            "left_knee": 90,
+            "right_knee": 92,
+            "left_elbow": 170,
+            "right_elbow": 170,
+            "torso_angle": 18,
         },
-        arm_phase_diff=-1.0,
+        hip_y=0.7,
     )
 
-    exercise, variant, confidence, source = manager._apply_external_variant(
-        (ExerciseType.ALTERNATE_BICEP_CURL, "alt-stand", 0.91),
-        ExerciseType.BICEP_CURL,
-        "bicep_curl",
-        0.63,
-        "fusion_agree",
-        curl_frame,
+    exercise, confidence, source = manager._apply_rule_gate(
+        squat_frame,
+        ExerciseType.SQUAT,
+        0.5,
+        "hmm",
     )
 
-    assert exercise == ExerciseType.ALTERNATE_BICEP_CURL
-    assert variant == "alt-stand"
-    assert confidence == 0.91
-    assert source == "external_variant"
+    assert exercise == ExerciseType.SQUAT
+    assert confidence >= 0.72  # Boosted by rule gate's higher score
+    assert source == "hmm"
 
 
-def test_pose_library_has_all_required_classes():
-    classifier = PoseKNNClassifier()
-    assert classifier.missing_required_libraries(REQUIRED_EXERCISE_LABELS, min_embeddings=1) == set()
+def test_removed_classifiers_are_not_importable():
+    """Regression: k-NN, fusion, and pose embedder must stay deleted."""
+    with pytest.raises(ModuleNotFoundError):
+        import pipeline.knn_classifier  # noqa: F401
+
+    with pytest.raises(ModuleNotFoundError):
+        import pipeline.fusion  # noqa: F401
+
+    with pytest.raises(ModuleNotFoundError):
+        import pipeline.pose_embedder  # noqa: F401

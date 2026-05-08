@@ -36,9 +36,6 @@ class Settings(BaseSettings):
     MAX_FILE_SIZE: int = 5 * 1024 * 1024 * 1024  # 5GB
     CHUNK_SIZE: int = 5 * 1024 * 1024  # 5MB
 
-    # Pose library export
-    POSE_LIBRARY_DIR: str = "./data/pose_library"
-    
     # Exercise detection settings
     MOTION_BUFFER_SIZE: int = 60  # frames
     CONFIDENCE_THRESHOLD: float = 0.80  # 80%
@@ -47,13 +44,13 @@ class Settings(BaseSettings):
     EXERCISE_SWITCH_MIN_SECONDS: float = 0.5
     EXERCISE_SWITCH_MIN_FRAMES: int = 6
     EXERCISE_SWITCH_CONFIDENCE: float = 0.6
-    # External classifier (ST-GCN) integration
-    EXTERNAL_CLASSIFIER_MIN_CONFIDENCE: float = 0.7
-    CURL_VARIANT_OVERRIDE_CONFIDENCE: float = 0.7
     SQUAT_RULE_GATE_CONFIDENCE: float = 0.72
     PUSHUP_HORIZONTAL_MIN_CONFIDENCE: float = 0.78
-    MIN_CLASS_LIBRARY_EMBEDDINGS: int = 1
     BLOCK_SWITCH_ON_UNRELIABLE: bool = True
+
+    # Stationary detection (motion variance over rolling window)
+    STATIONARY_WINDOW_FRAMES: int = 30
+    STATIONARY_THRESHOLD: float = 0.015  # Normalized image-space delta
     
     # Supabase settings (disabled for MVP)
     SUPABASE_ENABLED: bool = False

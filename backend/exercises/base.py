@@ -121,14 +121,15 @@ class ExerciseResult:
     """Result from exercise form analysis."""
     is_valid: bool
     rep_count: int
-    rep_phase: str  # "up", "down", "hold", "transition"
+    rep_phase: str  # "idle" | "setup" | "eccentric" | "concentric" | "hold"
+    phase_display: str = ""  # Human-readable per-exercise (e.g. "Lowering down")
     violations: list[str] = field(default_factory=list)
     corrections: list[str] = field(default_factory=list)
-    joint_colors: dict[str, str] = field(default_factory=dict)  # joint_name -> "green" | "red" | "yellow"
+    joint_colors: dict[str, str] = field(default_factory=dict)
     confidence: float = 0.0
     angles: Optional[JointAngles] = None
-    rep_quality: Optional[float] = None  # 0-1 quality score for last rep
-    partial_reps: int = 0  # Count of incomplete reps
+    rep_quality: Optional[float] = None
+    partial_reps: int = 0
 
 
 def calculate_angle(p1: Landmark, p2: Landmark, p3: Landmark) -> float:
@@ -172,34 +173,51 @@ def landmarks_to_dict(landmarks: list[dict]) -> dict[JointName, Landmark]:
 
 
 class BaseExercise(ABC):
-    """Abstract base class for exercise correction modules."""
+    """Abstract base class for exercise correction modules.
 
-    # Convert mechanical rep-counter phases to client-facing exercise phases.
-    # Subclasses override this when joint angle direction has different meaning.
-    PHASE_MAP = {
+    Phase semantics
+    ---------------
+    The rep counter emits mechanical phases tied to angle direction:
+      eccentric  = angle moving toward the lower threshold (joint flexing)
+      concentric = angle moving toward the upper threshold (joint extending)
+
+    For squat/pushup these align with the lift's loaded/unloaded phases
+    (eccentric = lowering body, concentric = pressing up). For bicep curl
+    the mapping flips: angle flexing = curling = the *concentric* of the
+    lift, angle extending = lowering = the *eccentric*. Subclasses set
+    SEMANTIC_PHASE_MAP accordingly so `rep_phase` is consistent across
+    exercises from the user's perspective.
+    """
+
+    # Mechanical (rep counter) → semantic (lift) phase mapping.
+    # Default: identity (correct for squat, pushup, and any joint-extension
+    # lift). BicepCurlModule swaps eccentric ↔ concentric.
+    SEMANTIC_PHASE_MAP: dict[str, str] = {
         "idle": "idle",
-        "ready": "ready",
-        "down": "down",
-        "up": "up",
+        "setup": "setup",
+        "eccentric": "eccentric",
+        "concentric": "concentric",
         "hold": "hold",
-        "transition": "transition"
     }
-    
+
+    # Subclasses override to provide per-exercise display text.
+    # Keys are semantic phases.
+    PHASE_DISPLAY: dict[str, str] = {
+        "idle": "",
+        "setup": "Get ready",
+        "eccentric": "Lowering",
+        "concentric": "Lifting",
+        "hold": "Hold",
+    }
+
     def __init__(self):
         self.rep_count = 0
         self.current_phase = "idle"
         self._phase_history: list[str] = []
         self._last_angles: Optional[JointAngles] = None
         self._rep_counter: Optional[HysteresisRepCounter] = None
-    
+
     def _create_rep_counter(self, upper_threshold: float, lower_threshold: float) -> HysteresisRepCounter:
-        """
-        Create a hysteresis-based rep counter.
-        
-        Args:
-            upper_threshold: Angle at extended/starting position
-            lower_threshold: Angle at contracted/bottom position
-        """
         self._rep_counter = HysteresisRepCounter(
             upper_threshold=upper_threshold,
             lower_threshold=lower_threshold,
@@ -207,35 +225,33 @@ class BaseExercise(ABC):
             max_rep_duration=10.0
         )
         return self._rep_counter
-    
-    def _map_phase(self, counter_phase: str) -> str:
-        """Map rep counter phase to client-friendly phase."""
-        return self.PHASE_MAP.get(counter_phase, "idle")
-    
+
+    def _to_semantic(self, mechanical_phase: str) -> str:
+        return self.SEMANTIC_PHASE_MAP.get(mechanical_phase, "idle")
+
+    def _phase_display(self, semantic_phase: str) -> str:
+        return self.PHASE_DISPLAY.get(semantic_phase, "")
+
     def update_rep_counter(
-        self, 
-        angle: float, 
+        self,
+        angle: float,
         left_angle: Optional[float] = None,
         right_angle: Optional[float] = None,
-        form_violations: Optional[list[str]] = None
+        form_violations: Optional[list[str]] = None,
+        visibility: Optional[float] = None,
     ) -> tuple[str, bool]:
-        """
-        Update rep counter with current angle.
-        
-        Returns:
-            Tuple of (phase_string, rep_just_completed)
-        """
+        """Update rep counter; returns (semantic_phase, rep_just_completed)."""
         if not self._rep_counter:
             return "idle", False
-        
+
         phase, rep_completed = self._rep_counter.update(
-            angle, left_angle, right_angle, form_violations
+            angle, left_angle, right_angle, form_violations, visibility
         )
-        
+
         if rep_completed:
             self.rep_count = self._rep_counter.rep_count
-        
-        return self._map_phase(phase.value), rep_completed
+
+        return self._to_semantic(phase.value), rep_completed
     
     @property
     def rep_quality(self) -> Optional[float]:
@@ -308,7 +324,8 @@ class BaseExercise(ABC):
                 return ExerciseResult(
                     is_valid=False,
                     rep_count=self.rep_count,
-                    rep_phase="unknown",
+                    rep_phase="idle",
+                    phase_display="",
                     violations=["Required joints not visible"],
                     corrections=["Please ensure your full body is in frame"]
                 )
@@ -316,11 +333,12 @@ class BaseExercise(ABC):
                 return ExerciseResult(
                     is_valid=False,
                     rep_count=self.rep_count,
-                    rep_phase="unknown",
+                    rep_phase="idle",
+                    phase_display="",
                     violations=[f"{joint.value} not clearly visible"],
                     corrections=["Adjust camera angle or lighting"]
                 )
-        
+
         # Detect rep phase (may update self.rep_count internally via _rep_counter)
         current_phase = self.detect_rep_phase(landmark_dict)
         self.current_phase = current_phase
@@ -328,11 +346,12 @@ class BaseExercise(ABC):
         self._phase_history.append(current_phase)
         if len(self._phase_history) > 30:
             self._phase_history.pop(0)
-        
+
         # Check form
         result = self.check_form(landmark_dict)
         result.rep_count = self.rep_count
         result.rep_phase = current_phase
+        result.phase_display = self._phase_display(current_phase)
         result.rep_quality = self.rep_quality
         result.partial_reps = self.partial_reps
 
@@ -350,8 +369,7 @@ class BaseExercise(ABC):
     
     def _is_rep_complete(self, last_phase: str, current_phase: str) -> bool:
         """Check if a rep was completed based on phase transition."""
-        # Rep complete when transitioning from "up" back to starting position
-        return last_phase == "up" and current_phase == "down"
+        return last_phase == "concentric" and current_phase in ("setup", "idle")
     
     def reset(self) -> None:
         """Reset rep counter and phase history."""

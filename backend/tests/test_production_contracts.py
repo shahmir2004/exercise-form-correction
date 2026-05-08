@@ -4,7 +4,7 @@ from fastapi import HTTPException
 from api.routes import list_supported_exercises
 from api.upload import InitUploadRequest, _safe_filename, _session_dir, _validate_init_request
 from config.settings import settings
-from exercises.registry import POSE_LIBRARY_LABELS, SUPPORTED_EXERCISE_LABELS
+from exercises.registry import SUPPORTED_EXERCISE_LABELS
 
 
 @pytest.mark.asyncio
@@ -14,10 +14,6 @@ async def test_supported_exercises_endpoint_lists_current_detection_contract():
 
     assert labels == SUPPORTED_EXERCISE_LABELS
     assert "alternate_bicep_curl" in labels
-
-
-def test_pose_library_contract_includes_idle_plus_supported_exercises():
-    assert POSE_LIBRARY_LABELS == SUPPORTED_EXERCISE_LABELS | {"idle"}
 
 
 def test_upload_filename_is_sanitized_to_basename_video_file():

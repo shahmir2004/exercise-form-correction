@@ -1,4 +1,4 @@
-"""Form Manager — thin orchestrator over probabilistic pipeline."""
+"""Form Manager — thin orchestrator over HMM + rule-gated pipeline."""
 
 import time
 import numpy as np
@@ -16,15 +16,14 @@ from pipeline.validator import InputValidator, ValidationError
 from pipeline.kalman import KalmanPoseTracker
 from pipeline.features import FeatureExtractor
 from pipeline.hmm import ExerciseHMM, ExState
-from pipeline.pose_embedder import embed_pose
-from pipeline.knn_classifier import PoseKNNClassifier
-from pipeline.fusion import ClassifierFusion
+from pipeline.motion_detector import MotionDetector
 from pipeline.form_evaluator import FormEvaluator, Violation
 from pipeline.confidence import ConfidenceComposer
 
 
 class SystemState(str, Enum):
     IDLE = "idle"
+    STATIONARY = "stationary"
     SCANNING = "scanning"
     ACTIVE = "active"
 
@@ -36,22 +35,19 @@ _EX_TYPE_TO_NAME: dict[ExerciseType, str] = {
     ExerciseType.ALTERNATE_BICEP_CURL: "alternate_bicep_curl",
 }
 
-_VARIANT_LABEL_TO_EXERCISE: dict[str, ExerciseType] = {
-    "curl-stand": ExerciseType.BICEP_CURL,
-    "curl-seat": ExerciseType.BICEP_CURL,
-    "alt-stand": ExerciseType.ALTERNATE_BICEP_CURL,
-    "alt-seat": ExerciseType.ALTERNATE_BICEP_CURL,
-    "bicep_curl": ExerciseType.BICEP_CURL,
-    "alternate_bicep_curl": ExerciseType.ALTERNATE_BICEP_CURL,
-    "squat": ExerciseType.SQUAT,
-    "pushup": ExerciseType.PUSHUP,
+_EX_STATE_TO_TYPE: dict[ExState, Optional[ExerciseType]] = {
+    ExState.IDLE: None,
+    ExState.SQUAT: ExerciseType.SQUAT,
+    ExState.PUSHUP: ExerciseType.PUSHUP,
+    ExState.CURL: ExerciseType.BICEP_CURL,
+    ExState.ALT_CURL: ExerciseType.ALTERNATE_BICEP_CURL,
 }
 
 _VARIANT_DISPLAY: dict[str, str] = {
-    "curl-stand": "Bicep Curl (Standing)",
-    "curl-seat": "Bicep Curl (Seated)",
-    "alt-stand": "Alt Bicep Curl (Standing)",
-    "alt-seat": "Alt Bicep Curl (Seated)",
+    "squat": "Squat",
+    "pushup": "Push-up",
+    "bicep_curl": "Bicep Curl",
+    "alternate_bicep_curl": "Alternate Bicep Curl",
 }
 
 _EXERCISE_MODULES: dict[ExerciseType, Type[BaseExercise]] = {
@@ -67,13 +63,13 @@ class FormManagerState:
     system_state: SystemState
     current_exercise: Optional[ExerciseType]
     exercise_result: Optional[ExerciseResult]
-    # New probabilistic fields
     exercise_confidence: float = 0.0
     form_confidence: float = 0.0
     signal_quality: str = "good"
     stable_violations: list = field(default_factory=list)
     exercise_variant: Optional[str] = None
-    exercise_source: str = "pipeline"
+    exercise_source: str = "hmm"
+    is_stationary: bool = False
     time_in_state: float = 0.0
     frames_processed: int = 0
 
@@ -82,26 +78,22 @@ class FormManager:
     """
     Orchestrates:
       InputValidator → KalmanPoseTracker → FeatureExtractor → ExerciseHMM
-      → ExerciseModule.process_frame (rep counting) → FormEvaluator → ConfidenceComposer
+      → rule-based safety gate → ExerciseModule.process_frame (rep counting)
+      → FormEvaluator → ConfidenceComposer
 
-    IDLE/SCANNING/ACTIVE states are derived from HMM posterior.
+    Single classifier (HMM) with rule-based angle-threshold gates as a
+    safety net. Stationary detection runs in parallel for UX feedback.
     """
 
     def __init__(self):
-        # Pipeline components
         self._validator = InputValidator()
         self._kalman = KalmanPoseTracker()
         self._feature_extractor = FeatureExtractor()
         self._hmm = ExerciseHMM()
-        self._embedder = embed_pose
-        self._knn = PoseKNNClassifier(
-            min_embeddings_per_class=settings.MIN_CLASS_LIBRARY_EMBEDDINGS
-        )
-        self._fusion = ClassifierFusion()
+        self._motion_detector = MotionDetector()
         self._form_evaluator = FormEvaluator()
         self._confidence_composer = ConfidenceComposer()
 
-        # State
         self._state = SystemState.IDLE
         self._current_exercise: Optional[ExerciseType] = None
         self._active_module: Optional[BaseExercise] = None
@@ -110,25 +102,14 @@ class FormManager:
         self._last_result: Optional[ExerciseResult] = None
         self._last_rep_phase: str = "idle"
         self._current_variant: Optional[str] = None
-        self._exercise_source: str = "pipeline"
+        self._exercise_source: str = "hmm"
         self._pending_exercise: Optional[ExerciseType] = None
-        self._pending_variant: Optional[str] = None
         self._pending_frames: int = 0
         self._pending_since: Optional[float] = None
+        self._is_stationary: bool = False
 
-    def process_frame(
-        self,
-        landmarks: list[dict],
-        client_probs: Optional[dict] = None,
-    ) -> FormManagerState:
-        """
-        Process a single frame.
-
-        Args:
-            landmarks: Raw landmark list from MediaPipe (33 landmarks)
-        Returns:
-            FormManagerState
-        """
+    def process_frame(self, landmarks: list[dict]) -> FormManagerState:
+        """Process a single frame."""
         self._frames_processed += 1
         t_start = time.perf_counter()
         now = time.time()
@@ -147,50 +128,35 @@ class FormManager:
         vis = validated.landmarks[:, 3]
         frame = self._feature_extractor.extract(smoothed_xyz, uncertainty, vis)
 
-        # 4. HMM classification
+        # 4. HMM classification (single classifier)
         hmm_result = self._hmm.update(frame)
+        hmm_exercise = _EX_STATE_TO_TYPE.get(hmm_result.most_likely_state)
+        hmm_conf = float(hmm_result.exercise_confidence)
 
-        # 4b. k-NN classification + fusion
-        embedding = self._embedder(frame.coords, frame.torso_length)
-        knn_ex, knn_conf = self._knn.classify(embedding)
-        fusion_result = self._fusion.fuse(hmm_result, knn_ex, knn_conf)
-        candidate_exercise = fusion_result.exercise
-        candidate_conf = fusion_result.confidence
-        candidate_variant = (
-            _EX_TYPE_TO_NAME.get(candidate_exercise) if candidate_exercise else None
-        )
-        candidate_source = fusion_result.source
+        candidate_exercise = hmm_exercise
+        candidate_conf = hmm_conf
+        candidate_source = "hmm"
 
-        # 4c. Exercise-first guard rules. These protect broad exercise
-        # detection from a sparse k-NN library or a curl-only external model.
-        candidate_exercise, candidate_variant, candidate_conf, candidate_source = (
+        # 4b. Rule-based safety gate.
+        # Angle-threshold heuristics catch HMM uncertainty (e.g. user clearly
+        # in pushup plank but HMM still ramping up). Acts as a confidence
+        # booster, not a competitor — only overrides when stronger.
+        candidate_exercise, candidate_conf, candidate_source = (
             self._apply_rule_gate(
-                frame,
-                candidate_exercise,
-                candidate_variant,
-                candidate_conf,
-                candidate_source,
+                frame, candidate_exercise, candidate_conf, candidate_source
             )
         )
 
-        # 4d. External classifier (ST-GCN) refines curl variants only.
-        ext = self._parse_external_probs(client_probs)
-        candidate_exercise, candidate_variant, candidate_conf, candidate_source = (
-            self._apply_external_variant(
-                ext,
-                candidate_exercise,
-                candidate_variant,
-                candidate_conf,
-                candidate_source,
-                frame,
-            )
-        )
+        # 5. Stationary detection (independent of HMM)
+        self._is_stationary = self._motion_detector.update(smoothed_xyz, vis)
 
-        # 5. Map HMM state to system state
+        # 6. Map to system state.
         idle_posterior = float(hmm_result.posterior[ExState.IDLE])
         max_non_idle = float(hmm_result.posterior[1:].max())
 
-        if idle_posterior > 0.7 or max_non_idle < 0.3:
+        if self._is_stationary and idle_posterior > 0.4:
+            new_sys_state = SystemState.STATIONARY
+        elif idle_posterior > 0.7 or max_non_idle < 0.3:
             new_sys_state = SystemState.IDLE
         elif max_non_idle < 0.7:
             new_sys_state = SystemState.SCANNING
@@ -198,7 +164,7 @@ class FormManager:
             new_sys_state = SystemState.ACTIVE
 
         if candidate_exercise is not None:
-            if candidate_conf >= 0.7:
+            if candidate_conf >= 0.7 and not self._is_stationary:
                 new_sys_state = SystemState.ACTIVE
             elif candidate_conf >= 0.3 and new_sys_state == SystemState.IDLE:
                 new_sys_state = SystemState.SCANNING
@@ -206,53 +172,34 @@ class FormManager:
         if new_sys_state != self._state:
             self._state = new_sys_state
             self._state_start_time = time.time()
-            # NB: do NOT reset _active_module on IDLE transitions. A user
-            # standing tall at the top of a squat rep momentarily looks like
-            # IDLE — wiping the rep counter there resets the count every rep.
-            # The module persists; only the FormEvaluator history (which is
-            # exercise-specific stable violations) needs clearing on idle.
             if new_sys_state == SystemState.IDLE:
                 self._form_evaluator.reset()
 
-        # 6. Map HMM to exercise type + activate module.
-        # Two cases:
-        #   (a) HMM is confident enough → (re)activate the matching module.
-        #   (b) HMM lost confidence (e.g. user momentarily standing tall at
-        #       the top of a rep) but a module is already active → keep
-        #       running it so the rep counter sees the angle returning to
-        #       extension. Letting the HMM gate every frame's rep update
-        #       resets reps mid-set.
-        detected_ex = candidate_exercise
-
-        # 6. Confidence composition (before switching, for quality gating)
+        # 7. Confidence composition (before switching, for quality gating)
         ex_name = _EX_TYPE_TO_NAME.get(self._current_exercise)
         conf_result = self._confidence_composer.compose(
             candidate_conf, frame, validated.quality_flags, ex_name
         )
 
-        # 6b. Exercise switching with hysteresis + rep-phase gating
+        # 8. Exercise switching with hysteresis + rep-phase gating
         self._maybe_switch_exercise(
-            detected_ex,
-            candidate_variant,
+            candidate_exercise,
             candidate_conf,
             candidate_source,
             new_sys_state,
             conf_result.signal_quality,
         )
 
+        # 9. Run active module (rep counting + form check)
         if self._active_module is not None:
             self._last_result = self._active_module.process_frame(landmarks)
             if self._last_result is not None:
                 self._last_rep_phase = self._last_result.rep_phase
 
-        # 7. Form evaluation (pipeline-based, temporally stable)
+        # 10. Form evaluation (pipeline-based, temporally stable)
         ex_name = _EX_TYPE_TO_NAME.get(self._current_exercise)
         stable_violations = self._form_evaluator.evaluate(frame, ex_name)
 
-        # Overlay stable violations on the module's result. We only mutate
-        # violation/correction/joint_color fields — rep_phase, rep_count,
-        # is_valid, and angles are owned by the exercise module and must
-        # not be overwritten here.
         if self._last_result is not None and stable_violations is not None:
             self._last_result.violations = [v.message for v in stable_violations]
             self._last_result.corrections = [v.correction for v in stable_violations if v.correction]
@@ -277,41 +224,38 @@ class FormManager:
     def _activate_module(
         self,
         exercise_type: ExerciseType,
-        variant: Optional[str],
         source: str,
     ) -> None:
         if self._active_module and self._current_exercise == exercise_type:
-            # Same base exercise; update variant label without resetting reps
-            self._current_variant = variant or self._current_variant
             self._exercise_source = source
             return
         module_class = _EXERCISE_MODULES.get(exercise_type)
         if module_class:
             self._active_module = module_class()
             self._current_exercise = exercise_type
-            self._current_variant = variant or _EX_TYPE_TO_NAME.get(exercise_type)
+            self._current_variant = _EX_TYPE_TO_NAME.get(exercise_type)
             self._exercise_source = source
 
     def _reset_pending(self) -> None:
         self._pending_exercise = None
-        self._pending_variant = None
         self._pending_frames = 0
         self._pending_since = None
 
     def _is_safe_to_switch(self) -> bool:
-        return self._last_rep_phase in ("idle", "ready")
+        # Only swap exercise modules when the rep counter is between reps.
+        # Mid-rep swapping causes phantom reps in the new module.
+        return self._last_rep_phase in ("idle", "setup")
 
     def _apply_rule_gate(
         self,
         frame,
         candidate_exercise: Optional[ExerciseType],
-        candidate_variant: Optional[str],
         candidate_conf: float,
         candidate_source: str,
-    ) -> tuple[Optional[ExerciseType], Optional[str], float, str]:
+    ) -> tuple[Optional[ExerciseType], float, str]:
         rule_exercise, rule_conf = self._rule_based_exercise(frame)
         if rule_exercise is None:
-            return candidate_exercise, candidate_variant, candidate_conf, candidate_source
+            return candidate_exercise, candidate_conf, candidate_source
 
         strong_gate = (
             (rule_exercise == ExerciseType.PUSHUP and
@@ -325,24 +269,25 @@ class FormManager:
         )
 
         if candidate_exercise is None:
-            return rule_exercise, _EX_TYPE_TO_NAME.get(rule_exercise), rule_conf, "rule_gate"
+            return rule_exercise, rule_conf, "rule_gate"
 
         if candidate_exercise == rule_exercise:
             return (
                 candidate_exercise,
-                candidate_variant or _EX_TYPE_TO_NAME.get(candidate_exercise),
                 max(candidate_conf, rule_conf),
                 candidate_source,
             )
 
+        # Disagreement: trust the rule gate when it's strongly confident
+        # AND the HMM is below the rule confidence (or rule says pushup/squat,
+        # which have unambiguous body-orientation signals).
         if strong_gate and (
             candidate_conf < rule_conf
-            or candidate_source in {"fusion_low_conf", "fusion_high_gap"}
             or rule_exercise in (ExerciseType.PUSHUP, ExerciseType.SQUAT)
         ):
-            return rule_exercise, _EX_TYPE_TO_NAME.get(rule_exercise), rule_conf, "rule_gate"
+            return rule_exercise, rule_conf, "rule_gate"
 
-        return candidate_exercise, candidate_variant, candidate_conf, candidate_source
+        return candidate_exercise, candidate_conf, candidate_source
 
     def _rule_based_exercise(self, frame) -> tuple[Optional[ExerciseType], float]:
         angles = frame.angles
@@ -352,10 +297,8 @@ class FormManager:
         right_elbow = float(angles.get("right_elbow", 180.0))
         torso = float(angles.get("torso_angle", 0.0))
 
-        min_knee = min(left_knee, right_knee)
         avg_knee = (left_knee + right_knee) / 2.0
         min_elbow = min(left_elbow, right_elbow)
-        avg_elbow = (left_elbow + right_elbow) / 2.0
         elbow_asym = abs(left_elbow - right_elbow)
 
         if frame.is_horizontal:
@@ -376,51 +319,18 @@ class FormManager:
 
         return None, 0.0
 
-    def _apply_external_variant(
-        self,
-        ext: Optional[tuple[ExerciseType, str, float]],
-        candidate_exercise: Optional[ExerciseType],
-        candidate_variant: Optional[str],
-        candidate_conf: float,
-        candidate_source: str,
-        frame,
-    ) -> tuple[Optional[ExerciseType], Optional[str], float, str]:
-        if ext is None:
-            return candidate_exercise, candidate_variant, candidate_conf, candidate_source
-
-        ext_exercise, ext_variant, ext_conf = ext
-        if ext_conf < settings.CURL_VARIANT_OVERRIDE_CONFIDENCE:
-            return candidate_exercise, candidate_variant, candidate_conf, candidate_source
-
-        if ext_exercise not in (ExerciseType.BICEP_CURL, ExerciseType.ALTERNATE_BICEP_CURL):
-            return candidate_exercise, candidate_variant, candidate_conf, candidate_source
-
-        rule_exercise, _ = self._rule_based_exercise(frame)
-        candidate_is_curl = candidate_exercise in (
-            ExerciseType.BICEP_CURL,
-            ExerciseType.ALTERNATE_BICEP_CURL,
-            None,
-        )
-        rule_allows_curl = rule_exercise in (
-            ExerciseType.BICEP_CURL,
-            ExerciseType.ALTERNATE_BICEP_CURL,
-            None,
-        )
-        if not (candidate_is_curl and rule_allows_curl):
-            return candidate_exercise, candidate_variant, candidate_conf, candidate_source
-
-        return ext_exercise, ext_variant, max(candidate_conf, ext_conf), "external_variant"
-
     def _maybe_switch_exercise(
         self,
         candidate_exercise: Optional[ExerciseType],
-        candidate_variant: Optional[str],
         candidate_conf: float,
         candidate_source: str,
         new_sys_state: SystemState,
         signal_quality: str,
     ) -> None:
-        if candidate_exercise is None or new_sys_state == SystemState.IDLE:
+        if (
+            candidate_exercise is None
+            or new_sys_state in (SystemState.IDLE, SystemState.STATIONARY)
+        ):
             self._reset_pending()
             return
 
@@ -437,25 +347,19 @@ class FormManager:
             self._reset_pending()
             return
 
-        if (
-            candidate_exercise == self._current_exercise
-            and candidate_variant == self._current_variant
-        ):
+        if candidate_exercise == self._current_exercise:
             self._reset_pending()
             return
 
         now = time.time()
-        if (
-            candidate_exercise != self._pending_exercise
-            or candidate_variant != self._pending_variant
-        ):
+        if candidate_exercise != self._pending_exercise:
             self._pending_exercise = candidate_exercise
-            self._pending_variant = candidate_variant
             self._pending_frames = 1
             self._pending_since = now
             return
 
         self._pending_frames += 1
+        # Mid-rep gate: don't swap modules while a rep is in flight.
         if not self._is_safe_to_switch():
             return
 
@@ -466,37 +370,8 @@ class FormManager:
             self._pending_frames >= settings.EXERCISE_SWITCH_MIN_FRAMES
             and (now - self._pending_since) >= settings.EXERCISE_SWITCH_MIN_SECONDS
         ):
-            self._activate_module(candidate_exercise, candidate_variant, candidate_source)
+            self._activate_module(candidate_exercise, candidate_source)
             self._reset_pending()
-
-    def _parse_external_probs(
-        self,
-        client_probs: Optional[dict],
-    ) -> Optional[tuple[ExerciseType, str, float]]:
-        if not isinstance(client_probs, dict) or not client_probs:
-            return None
-
-        best_label = None
-        best_score = -1.0
-        for label, score in client_probs.items():
-            if not isinstance(label, str):
-                continue
-            try:
-                score_val = float(score)
-            except (TypeError, ValueError):
-                continue
-            if score_val > best_score:
-                best_label = label
-                best_score = score_val
-
-        if best_label is None:
-            return None
-
-        exercise = _VARIANT_LABEL_TO_EXERCISE.get(best_label)
-        if exercise is None:
-            return None
-
-        return exercise, best_label, float(best_score)
 
     def _create_state(
         self,
@@ -515,6 +390,7 @@ class FormManager:
             stable_violations=stable_violations,
             exercise_variant=self._current_variant,
             exercise_source=self._exercise_source,
+            is_stationary=self._is_stationary,
             time_in_state=time.time() - self._state_start_time,
             frames_processed=self._frames_processed,
         )
@@ -534,7 +410,9 @@ class FormManager:
     def get_state_display(self) -> str:
         if self._state == SystemState.IDLE:
             return "Waiting for person..."
-        elif self._state == SystemState.SCANNING:
+        if self._state == SystemState.STATIONARY:
+            return "Hold still — start your reps when ready"
+        if self._state == SystemState.SCANNING:
             return "Detecting exercise..."
         return f"Activity: {self.get_exercise_name()}"
 
@@ -543,20 +421,20 @@ class FormManager:
         self._current_exercise = None
         self._active_module = None
         self._current_variant = None
-        self._exercise_source = "pipeline"
+        self._exercise_source = "hmm"
         self._pending_exercise = None
-        self._pending_variant = None
         self._pending_frames = 0
         self._pending_since = None
         self._state_start_time = time.time()
         self._frames_processed = 0
         self._last_result = None
         self._last_rep_phase = "idle"
+        self._is_stationary = False
         self._validator.reset()
         self._kalman.reset()
         self._feature_extractor.reset()
         self._hmm.reset()
-        self._fusion.reset()
+        self._motion_detector.reset()
         self._form_evaluator.reset()
 
     @property
@@ -574,3 +452,7 @@ class FormManager:
     @property
     def rep_count(self) -> int:
         return self._active_module.rep_count if self._active_module else 0
+
+    @property
+    def is_stationary(self) -> bool:
+        return self._is_stationary

@@ -32,7 +32,6 @@ SUPPORTED_EXERCISES: tuple[ExerciseDefinition, ...] = (
 IDLE_LABEL = "idle"
 
 SUPPORTED_EXERCISE_LABELS = frozenset(defn.label for defn in SUPPORTED_EXERCISES)
-POSE_LIBRARY_LABELS = SUPPORTED_EXERCISE_LABELS | {IDLE_LABEL}
 VARIANT_LABELS = frozenset(
     variant
     for definition in SUPPORTED_EXERCISES

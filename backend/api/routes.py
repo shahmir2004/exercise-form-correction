@@ -19,26 +19,26 @@ _CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
 
 
 class FormCorrectionResponse(BaseModel):
-    """Response sent back to client — backwards compatible + new fields."""
-    state: str
+    """Response sent back to client."""
+    state: str  # "idle" | "stationary" | "scanning" | "active"
     current_exercise: Optional[str]
     exercise_display: str
     rep_count: int
-    rep_phase: str
+    rep_phase: str  # "idle" | "setup" | "eccentric" | "concentric" | "hold"
+    phase_display: str  # Human-readable per-exercise (e.g. "Lowering down")
     is_rep_valid: bool
     violations: list[str]
     corrections: list[str]
     correction_message: str
     joint_colors: dict[str, str]
-    # Legacy field: aliased to form_confidence
-    confidence: float
+    confidence: float  # Legacy alias of form_confidence
+    is_stationary: bool
     timestamp: float
-    # New fields (additive — gymi ignores unknown fields)
     exercise_confidence: float = 0.0
     form_confidence: float = 0.0
     signal_quality: str = "good"
     exercise_variant: Optional[str] = None
-    exercise_source: str = "pipeline"
+    exercise_source: str = "hmm"
 
 
 class ConnectionManager:
@@ -104,27 +104,26 @@ async def pose_websocket(websocket: WebSocket, client_id: str):
                 continue
 
             landmarks = data["landmarks"]
-            client_probs = data.get("client_probs")
             timestamp = data.get("timestamp", 0)
 
-            # Process frame through new pipeline
-            state = form_manager.process_frame(landmarks, client_probs)
+            state = form_manager.process_frame(landmarks)
 
+            result = state.exercise_result
             response = FormCorrectionResponse(
                 state=state.system_state.value,
                 current_exercise=state.current_exercise.value if state.current_exercise else None,
                 exercise_display=form_manager.get_state_display(),
                 rep_count=form_manager.rep_count,
-                rep_phase=state.exercise_result.rep_phase if state.exercise_result else "idle",
-                is_rep_valid=state.exercise_result.is_valid if state.exercise_result else True,
-                violations=state.exercise_result.violations if state.exercise_result else [],
-                corrections=state.exercise_result.corrections if state.exercise_result else [],
-                correction_message=_build_correction_message(state.exercise_result),
-                joint_colors=state.exercise_result.joint_colors if state.exercise_result else {},
-                # Legacy field aliased to form_confidence
+                rep_phase=result.rep_phase if result else "idle",
+                phase_display=result.phase_display if result else "",
+                is_rep_valid=result.is_valid if result else True,
+                violations=result.violations if result else [],
+                corrections=result.corrections if result else [],
+                correction_message=_build_correction_message(result),
+                joint_colors=result.joint_colors if result else {},
                 confidence=state.form_confidence,
+                is_stationary=state.is_stationary,
                 timestamp=timestamp,
-                # New fields
                 exercise_confidence=state.exercise_confidence,
                 form_confidence=state.form_confidence,
                 signal_quality=state.signal_quality,

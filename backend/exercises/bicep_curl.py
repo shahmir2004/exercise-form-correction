@@ -15,37 +15,47 @@ from .base import (
 
 class BicepCurlModule(BaseExercise):
     """Bicep curl exercise detection and form correction.
-    
+
     Supports both standing and seated bicep curls.
     """
 
-    PHASE_MAP = {
+    # Mechanical→semantic mapping is SWAPPED for bicep curl: when the elbow
+    # angle decreases (mechanical eccentric), the user is curling up — that
+    # is the *concentric* phase of the lift. When the angle increases
+    # (mechanical concentric), they are lowering — the lift's *eccentric*.
+    SEMANTIC_PHASE_MAP = {
         "idle": "idle",
-        "ready": "ready",
-        "down": "up",       # Elbow angle decreasing: curling upward.
-        "up": "down",       # Elbow angle increasing: lowering to extension.
+        "setup": "setup",
+        "eccentric": "concentric",
+        "concentric": "eccentric",
         "hold": "hold",
-        "transition": "transition",
     }
-    
-    # Form thresholds - IMPROVED for better detection
-    MIN_ELBOW_ANGLE = 50   # Was 30 - top of curl (more forgiving)
-    MAX_ELBOW_ANGLE = 145  # Was 160 - bottom of curl (more forgiving)
-    
-    # Hysteresis to prevent flickering between states
-    ANGLE_HYSTERESIS = 15  # Degrees of buffer
-    
-    # Form thresholds - slightly relaxed for real-world conditions
-    ELBOW_DRIFT_THRESHOLD = 0.06  # Was 0.03 - normalized X difference
-    BODY_SWING_THRESHOLD = 0.04   # Was 0.02 - allowed shoulder movement
-    WRIST_CURL_THRESHOLD = 20     # Wrist angle deviation
-    
-    # Detection settings
-    MIN_VISIBILITY = 0.3   # Lowered from implicit 0.5
-    SMOOTHING_WINDOW = 5   # Number of frames for angle smoothing
-    MIN_FRAMES_TO_CONFIRM = 3  # Frames needed to confirm state change
-    REP_EXTENDED_THRESHOLD = 140
-    REP_CONTRACTED_THRESHOLD = 130
+
+    PHASE_DISPLAY = {
+        "idle": "",
+        "setup": "Arms extended",
+        "eccentric": "Lowering",
+        "concentric": "Curling up",
+        "hold": "At top",
+    }
+
+    # Form thresholds - tightened to require real ROM (was 140°/130° = 10°)
+    MIN_ELBOW_ANGLE = 50    # top of curl (fully contracted)
+    MAX_ELBOW_ANGLE = 160   # bottom of curl (fully extended)
+
+    ANGLE_HYSTERESIS = 15
+
+    ELBOW_DRIFT_THRESHOLD = 0.06
+    BODY_SWING_THRESHOLD = 0.04
+    WRIST_CURL_THRESHOLD = 20
+
+    MIN_VISIBILITY = 0.3
+    SMOOTHING_WINDOW = 5
+    MIN_FRAMES_TO_CONFIRM = 3
+    # Tightened ROM gate: require true full extension and contraction.
+    # Previous 140°/130° (10° band) accepted micro-movements as reps.
+    REP_EXTENDED_THRESHOLD = 160
+    REP_CONTRACTED_THRESHOLD = 60
     
     # Seated detection
     SEATED_HIP_ANGLE_MIN = 70   # Hip angle when seated (bent at hips)
@@ -212,8 +222,23 @@ class BicepCurlModule(BaseExercise):
             joints = [JointName.LEFT_SHOULDER, JointName.LEFT_ELBOW, JointName.LEFT_WRIST]
         else:
             joints = [JointName.RIGHT_SHOULDER, JointName.RIGHT_ELBOW, JointName.RIGHT_WRIST]
-        
+
         return all(landmarks[j].visibility > self.MIN_VISIBILITY for j in joints)
+
+    def _arm_visibility(self, landmarks: dict[JointName, Landmark], side: str) -> float:
+        if side == "left":
+            joints = [JointName.LEFT_SHOULDER, JointName.LEFT_ELBOW, JointName.LEFT_WRIST]
+        else:
+            joints = [JointName.RIGHT_SHOULDER, JointName.RIGHT_ELBOW, JointName.RIGHT_WRIST]
+        return min(landmarks[j].visibility for j in joints)
+
+    def _active_arm_visibility(self, landmarks: dict[JointName, Landmark]) -> float:
+        """Return the worst visibility across the active arm's joints."""
+        if self._active_arm == "left":
+            return self._arm_visibility(landmarks, "left")
+        if self._active_arm == "right":
+            return self._arm_visibility(landmarks, "right")
+        return min(self._arm_visibility(landmarks, "left"), self._arm_visibility(landmarks, "right"))
     
     def _detect_active_arm(self, landmarks: dict[JointName, Landmark]) -> str:
         """Detect which arm(s) are performing the curl."""
@@ -335,10 +360,13 @@ class BicepCurlModule(BaseExercise):
         
         # Use hysteresis-based rep counter for stable phase detection
         if self._rep_counter:
+            # Visibility = the active arm's worst-visible required joint.
+            arm_vis = self._active_arm_visibility(landmarks)
             phase_str, rep_completed = self.update_rep_counter(
                 angle=elbow_angle,
                 left_angle=left_angle,
-                right_angle=right_angle
+                right_angle=right_angle,
+                visibility=arm_vis,
             )
             
             # Track min/max for ROM validation and depth checking
@@ -424,7 +452,7 @@ class BicepCurlModule(BaseExercise):
         full_extension, full_contraction = self._check_full_rom(angles)
         
         # Only check ROM if we're in an active curl (reduce false positives)
-        if self.current_phase in ("up", "hold") and not full_contraction:
+        if self.current_phase in ("concentric", "hold") and not full_contraction:
             # Be lenient - only flag if significantly incomplete
             active_angle = angles.left_elbow if self._active_arm == "left" else angles.right_elbow
             if self._active_arm == "both":
@@ -463,8 +491,8 @@ class BicepCurlModule(BaseExercise):
         )
     
     def _is_rep_complete(self, last_phase: str, current_phase: str) -> bool:
-        """Rep complete when returning to bottom from top."""
-        return last_phase == "down" and current_phase == "idle"
+        """Rep complete when returning to extension from curl."""
+        return last_phase == "eccentric" and current_phase in ("setup", "idle")
     
     def reset(self) -> None:
         """Reset all tracking state."""
@@ -603,13 +631,17 @@ class AlternateBicepCurlModule(BicepCurlModule):
         curling_arm = self._detect_curling_arm(landmarks)
         
         # Update both arm counters
+        left_vis = self._arm_visibility(landmarks, "left")
+        right_vis = self._arm_visibility(landmarks, "right")
         left_phase, left_completed = self._left_rep_counter.update(
             angles.left_elbow,
-            left_angle=angles.left_elbow
+            left_angle=angles.left_elbow,
+            visibility=left_vis,
         )
         right_phase, right_completed = self._right_rep_counter.update(
             angles.right_elbow,
-            right_angle=angles.right_elbow
+            right_angle=angles.right_elbow,
+            visibility=right_vis,
         )
         
         # Track lowest angles for each arm (for depth validation)
@@ -641,15 +673,15 @@ class AlternateBicepCurlModule(BicepCurlModule):
         
         # Determine overall phase based on which arm is active and map to client-friendly phase
         if curling_arm == "left":
-            return self._map_phase(left_phase.value)
+            return self._to_semantic(left_phase.value)
         elif curling_arm == "right":
-            return self._map_phase(right_phase.value)
+            return self._to_semantic(right_phase.value)
         else:
             # Neither curling - use the expected arm's phase
             if self._current_arm == "left":
-                return self._map_phase(left_phase.value)
+                return self._to_semantic(left_phase.value)
             else:
-                return self._map_phase(right_phase.value)
+                return self._to_semantic(right_phase.value)
     
     def check_form(self, landmarks: dict[JointName, Landmark]) -> ExerciseResult:
         """Analyze alternate bicep curl form.

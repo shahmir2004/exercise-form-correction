@@ -11,12 +11,21 @@ import time
 
 
 class RepPhase(str, Enum):
+    """Mechanical rep counter phase, semantic to angle direction.
+
+    ECCENTRIC = angle moving toward lower threshold (joint flexing).
+    CONCENTRIC = angle moving toward upper threshold (joint extending).
+
+    Each exercise module maps these mechanical phases to user-facing
+    eccentric/concentric labels — for squat/pushup the mapping is identity;
+    for bicep curl the mapping is swapped (flexion = concentric of the lift).
+    """
     IDLE = "idle"
-    READY = "ready"
-    ECCENTRIC = "down"
-    CONCENTRIC = "up"
+    READY = "setup"
+    ECCENTRIC = "eccentric"
+    CONCENTRIC = "concentric"
     HOLD = "hold"
-    TRANSITION = "transition"
+    TRANSITION = "setup"
 
 
 @dataclass
@@ -73,13 +82,16 @@ class HysteresisRepCounter:
         self._left_angle: float = 0.0
         self._right_angle: float = 0.0
         self._has_seen_upper: bool = False
+        self._min_visibility_in_rep: float = 1.0
+        self._low_visibility_streak: int = 0
 
     def update(
         self,
         angle: float,
         left_angle: Optional[float] = None,
         right_angle: Optional[float] = None,
-        form_violations: Optional[list[str]] = None
+        form_violations: Optional[list[str]] = None,
+        visibility: Optional[float] = None,
     ) -> tuple[RepPhase, bool]:
         self._angle_history.append(angle)
         self._min_angle_in_rep = min(self._min_angle_in_rep, angle)
@@ -91,6 +103,27 @@ class HysteresisRepCounter:
             self._right_angle = right_angle
         if form_violations:
             self._form_violations.extend(form_violations)
+
+        # Visibility gating: if required joints drop out of frame, abort the
+        # in-flight rep. Prevents counting partial reps when the user steps
+        # out and back into view mid-set.
+        if visibility is not None:
+            self._min_visibility_in_rep = min(self._min_visibility_in_rep, visibility)
+            if visibility < 0.3:
+                self._low_visibility_streak += 1
+                if self._low_visibility_streak >= 3 and self._phase in (
+                    RepPhase.ECCENTRIC,
+                    RepPhase.CONCENTRIC,
+                ):
+                    self._phase = RepPhase.READY
+                    self._min_angle_in_rep = 180.0
+                    self._max_angle_in_rep = 0.0
+                    self._min_visibility_in_rep = 1.0
+                    self._rep_start_time = time.time()
+                    self._form_violations = []
+                    return self._phase, False
+            else:
+                self._low_visibility_streak = 0
 
         current_time = time.time()
         rep_completed = False
@@ -146,6 +179,7 @@ class HysteresisRepCounter:
                 self._phase = RepPhase.READY
                 self._min_angle_in_rep = 180.0
                 self._max_angle_in_rep = 0.0
+                self._min_visibility_in_rep = 1.0
                 self._rep_start_time = current_time
                 self._form_violations = []
 
@@ -169,6 +203,9 @@ class HysteresisRepCounter:
                 return False
             if self._min_angle_in_rep > self.lower_threshold:
                 return False
+        # Reject reps where any tracked joint dropped below 0.5 visibility.
+        if self._min_visibility_in_rep < 0.5:
+            return False
         return True
 
     def _calculate_rep_quality(self, duration: float) -> RepQuality:
@@ -230,6 +267,8 @@ class HysteresisRepCounter:
         self._reps.clear()
         self._form_violations.clear()
         self._has_seen_upper = False
+        self._min_visibility_in_rep = 1.0
+        self._low_visibility_streak = 0
 
 
 class ExerciseRepCounter:
