@@ -203,9 +203,11 @@ class HysteresisRepCounter:
                 return False
             if self._min_angle_in_rep > self.lower_threshold:
                 return False
-        # Reject reps where any tracked joint dropped below 0.5 visibility.
-        if self._min_visibility_in_rep < 0.5:
-            return False
+        # NB: do NOT reject on per-rep minimum visibility. MediaPipe routinely
+        # reports 0.4–0.6 visibility for partly-occluded but clearly-visible
+        # joints; a single low-visibility frame would poison the entire rep.
+        # The 3-frame "vis < 0.3" streak abort in update() already handles
+        # the real failure mode (user steps out of frame).
         return True
 
     def _calculate_rep_quality(self, duration: float) -> RepQuality:

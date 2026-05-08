@@ -39,7 +39,7 @@ class BicepCurlModule(BaseExercise):
         "hold": "At top",
     }
 
-    # Form thresholds - tightened to require real ROM (was 140°/130° = 10°)
+    # Form thresholds
     MIN_ELBOW_ANGLE = 50    # top of curl (fully contracted)
     MAX_ELBOW_ANGLE = 160   # bottom of curl (fully extended)
 
@@ -52,10 +52,13 @@ class BicepCurlModule(BaseExercise):
     MIN_VISIBILITY = 0.3
     SMOOTHING_WINDOW = 5
     MIN_FRAMES_TO_CONFIRM = 3
-    # Tightened ROM gate: require true full extension and contraction.
-    # Previous 140°/130° (10° band) accepted micro-movements as reps.
-    REP_EXTENDED_THRESHOLD = 160
-    REP_CONTRACTED_THRESHOLD = 60
+    # Rep counter ROM gate. The previous 140°/130° (10° band) accepted
+    # micro-movements as reps; the briefly-tried 160°/60° required near-
+    # perfect ROM and never registered through the 5-frame angle smoother.
+    # 150°/80° = 70° band, achievable for normal curls (peak elbow ~70°
+    # smooths to ~75°; peak extension ~165° smooths to ~160°).
+    REP_EXTENDED_THRESHOLD = 150
+    REP_CONTRACTED_THRESHOLD = 80
     
     # Seated detection
     SEATED_HIP_ANGLE_MIN = 70   # Hip angle when seated (bent at hips)
@@ -648,24 +651,29 @@ class AlternateBicepCurlModule(BicepCurlModule):
         self._left_lowest_angle = min(self._left_lowest_angle, angles.left_elbow)
         self._right_lowest_angle = min(self._right_lowest_angle, angles.right_elbow)
         
-        # Handle rep completion for each arm
+        # Handle rep completion for each arm.
+        # A "rep" in alternate curl = one full cycle of BOTH arms, so the
+        # surfaced rep_count is min(left_reps, right_reps). Doing 3 lefts
+        # then 3 rights still ends at 3 (not 6), and a single arm alone
+        # cannot increment the count.
         if left_completed:
             self._left_rep_count += 1
-            self.rep_count = self._left_rep_count + self._right_rep_count
             self._last_curling_arm = "left"
-            self._current_arm = "right"  # Switch to other arm
+            self._current_arm = "right"
             self._frames_since_last_rep = 0
             self._left_lowest_angle = 180.0
             self._left_in_curl = False
-        
+
         if right_completed:
             self._right_rep_count += 1
-            self.rep_count = self._left_rep_count + self._right_rep_count
             self._last_curling_arm = "right"
-            self._current_arm = "left"  # Switch to other arm
+            self._current_arm = "left"
             self._frames_since_last_rep = 0
             self._right_lowest_angle = 180.0
             self._right_in_curl = False
+
+        if left_completed or right_completed:
+            self.rep_count = min(self._left_rep_count, self._right_rep_count)
         
         # Update curl state based on current position
         self._left_in_curl = angles.left_elbow < self.MAX_ELBOW_ANGLE - 20
