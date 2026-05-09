@@ -72,9 +72,10 @@ class ConfidenceComposer:
         weighted_conf = 0.0
         for idx, w in weights.items():
             unc = float(frame.uncertainty[idx])
+            vis = float(frame.visibility[idx]) if idx < len(frame.visibility) else 1.0
             # Convert Kalman trace uncertainty to a 0-1 confidence
             # uncertainty of 0 → conf 1.0; uncertainty of 0.1 → conf ~0.5
-            joint_conf = float(np.exp(-unc * 20.0))
+            joint_conf = float(np.exp(-unc * 20.0)) * float(np.clip(vis, 0.0, 1.0))
             weighted_conf += joint_conf * w
             total_w += w
 
@@ -83,12 +84,15 @@ class ConfidenceComposer:
 
         base_conf = weighted_conf / total_w
 
-        # Penalize for partial body
-        if flags.partial_body:
-            base_conf *= 0.6
+        curl_exercises = {"bicep_curl", "alternate_bicep_curl"}
+        if not exercise_name or exercise_name not in curl_exercises:
+            # Unknown exercise fallback still treats missing full-body signal
+            # as lower confidence. Known exercises are scored by their own
+            # weighted joints, which allows upper-body-only curl detection.
+            if flags.partial_body:
+                base_conf *= 0.6
 
-        # Penalize for off-screen joints
-        off_screen_penalty = min(0.4, flags.off_screen_count * 0.03)
-        base_conf *= (1.0 - off_screen_penalty)
+            off_screen_penalty = min(0.4, flags.off_screen_count * 0.03)
+            base_conf *= (1.0 - off_screen_penalty)
 
         return float(np.clip(base_conf, 0.0, 1.0))

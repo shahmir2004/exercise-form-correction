@@ -105,10 +105,10 @@ class Settings(BaseSettings):
     # min_rep_frames is the minimum peak-to-peak distance (≈ 0.5s @ 20fps).
     # ClassVar so pydantic-settings doesn't treat it as an env-loaded field.
     REP_DETECTION: ClassVar[Dict[str, Dict[str, Any]]] = {
-        "squat":               {"prominence": 30.0, "min_rep_frames": 10, "smooth_window": 9},
-        "pushup":              {"prominence": 30.0, "min_rep_frames": 10, "smooth_window": 9},
+        "squat":               {"prominence": 22.0, "min_rep_frames": 8, "smooth_window": 7},
+        "pushup":              {"prominence": 22.0, "min_rep_frames": 8, "smooth_window": 7},
         "bicep_curl":          {"prominence": 25.0, "min_rep_frames": 8,  "smooth_window": 7},
-        "alternate_bicep_curl":{"prominence": 25.0, "min_rep_frames": 8,  "smooth_window": 7},
+        "alternate_bicep_curl":{"prominence": 18.0, "min_rep_frames": 6,  "smooth_window": 7},
     }
 
     # Mid-video exercise switching. Allows handing off from one exercise to

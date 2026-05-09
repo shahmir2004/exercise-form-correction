@@ -49,6 +49,18 @@ Set `VITE_API_URL=https://exercise-form-backend.onrender.com` in your `.env`.
 
 ---
 
+## Current Coach Stabilization
+
+This release focuses on making the Gymi exhibition flow reliable:
+
+- Stable phase labels: still-standing and top-position landmark jitter resolves to `hold` or `setup`, while real movement still emits `eccentric` and `concentric`.
+- More reliable reps: short clean exhibition-speed reps are counted with a threshold fallback, while noisy partial movement does not increment reps.
+- Partial curl support: bicep curls can be analyzed with upper body only in frame.
+- Camera perspective metadata: WebSocket clients can request `auto`, `front`, `side`, or `three_quarter`; the response includes the resolved `camera_view`.
+- Safer exercise gating: squats with bent hands in front are guarded from being misclassified as bicep curls.
+
+---
+
 ## 🧠 ST-GCN Client-Side Classifier
 
 ### What Is It?
@@ -539,6 +551,7 @@ WS /api/ws/pose/{client_id}
     "... 33 landmarks total ..."
   ],
   "timestamp": 1234567890.123,
+  "camera_view": "auto",
   "client_probs": {
     "curl-stand": 0.82,
     "curl-seat":  0.06,
@@ -550,6 +563,8 @@ WS /api/ws/pose/{client_id}
 
 `client_probs` is **optional**. If omitted, the backend classifies using HMM + k-NN alone. If present, the probabilities refine curl variants only; squat and push-up detection remain guarded by backend pose rules.
 
+`camera_view` is optional and accepts `auto`, `front`, `side`, or `three_quarter`. When omitted, the backend estimates the view from pose geometry.
+
 **Receive (Server → Client) — per frame:**
 ```json
 {
@@ -557,7 +572,8 @@ WS /api/ws/pose/{client_id}
   "current_exercise": "bicep_curl",
   "exercise_display": "Bicep Curl",
   "rep_count": 3,
-  "rep_phase": "down",
+  "rep_phase": "concentric",
+  "phase_display": "Curling up",
   "is_rep_valid": true,
   "violations": ["Left elbow drifting forward"],
   "corrections": ["Keep your left elbow pinned to your side"],
@@ -567,6 +583,7 @@ WS /api/ws/pose/{client_id}
   "exercise_confidence": 0.91,
   "form_confidence": 0.88,
   "signal_quality": "good",
+  "camera_view": "front",
   "exercise_variant": "curl-stand",
   "exercise_source": "external_variant"
 }
@@ -579,14 +596,24 @@ WS /api/ws/pose/{client_id}
 | `state` | `"idle"` \| `"scanning"` \| `"active"` | Session state machine state |
 | `current_exercise` | string \| null | Detected exercise key |
 | `rep_count` | int | Total completed reps this session |
-| `rep_phase` | string | Current phase within a rep (`up`/`down`/`hold`/etc.) |
+| `rep_phase` | string | Semantic lift phase: `idle`, `setup`, `eccentric`, `concentric`, or `hold` |
+| `phase_display` | string | Exercise-specific text such as `Lowering down`, `Driving up`, or `Curling up` |
 | `violations` | string[] | Active form issues |
 | `joint_colors` | object | Per-joint color (`"green"`, `"yellow"`, `"red"`) |
 | `exercise_confidence` | float 0–1 | Fusion classifier confidence |
 | `form_confidence` | float 0–1 | Kalman-uncertainty-weighted joint quality |
 | `signal_quality` | string | Overall pose signal quality |
+| `camera_view` | string | Resolved camera perspective: `front`, `side`, `three_quarter`, or `auto` |
 | `exercise_variant` | string \| null | Variant label, e.g. `curl-stand` or `alt-seat` |
 | `exercise_source` | string | Decision source, e.g. `rule_gate`, `fusion_agree`, or `external_variant` |
+
+### Rep Phase Stability Notes
+
+The rep counter separates phase display from rep completion:
+
+- Phase display uses smoothed angle velocity plus a stillness band. Small MediaPipe jitter while standing still or holding at the top/bottom returns `hold`/`setup`, not alternating movement labels.
+- Rep completion still requires a real threshold cycle from the lower ROM gate back to the upper ROM gate, so the stillness filter does not count fake reps.
+- Squat and push-up use identity phase semantics (`eccentric` = lowering, `concentric` = driving/pressing up). Bicep curl swaps the mechanical direction so `concentric` means curling up.
 
 ### REST Endpoints
 

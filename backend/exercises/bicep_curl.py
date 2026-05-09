@@ -105,11 +105,16 @@ class BicepCurlModule(BaseExercise):
             JointName.RIGHT_ELBOW,
             JointName.LEFT_WRIST,
             JointName.RIGHT_WRIST,
+        ]
+
+    def _lower_body_visible(self, landmarks: dict[JointName, Landmark]) -> bool:
+        joints = [
             JointName.LEFT_HIP,
             JointName.RIGHT_HIP,
             JointName.LEFT_KNEE,
             JointName.RIGHT_KNEE,
         ]
+        return all(landmarks[j].visibility > self.MIN_VISIBILITY for j in joints)
     
     def _detect_seated_position(self, landmarks: dict[JointName, Landmark]) -> bool:
         """Detect if user is in a seated position.
@@ -120,6 +125,8 @@ class BicepCurlModule(BaseExercise):
         - Hip Y position is lower relative to knee (sitting)
         """
         try:
+            if not self._lower_body_visible(landmarks):
+                return False
             # Calculate hip angle (shoulder-hip-knee)
             left_hip_angle = calculate_angle(
                 landmarks[JointName.LEFT_SHOULDER],
@@ -199,18 +206,23 @@ class BicepCurlModule(BaseExercise):
         else:
             angles.right_elbow = 180.0  # Default extended
         
-        # Shoulder angles for detecting arm raise (shoulder-hip-knee equivalent)
-        angles.left_shoulder = calculate_angle(
-            landmarks[JointName.LEFT_ELBOW],
-            landmarks[JointName.LEFT_SHOULDER],
-            landmarks[JointName.LEFT_HIP]
-        )
-        
-        angles.right_shoulder = calculate_angle(
-            landmarks[JointName.RIGHT_ELBOW],
-            landmarks[JointName.RIGHT_SHOULDER],
-            landmarks[JointName.RIGHT_HIP]
-        )
+        # Shoulder angles need hips. Half-body curl framing is valid, so skip
+        # this form cue when lower body is not visible.
+        if self._lower_body_visible(landmarks):
+            angles.left_shoulder = calculate_angle(
+                landmarks[JointName.LEFT_ELBOW],
+                landmarks[JointName.LEFT_SHOULDER],
+                landmarks[JointName.LEFT_HIP]
+            )
+
+            angles.right_shoulder = calculate_angle(
+                landmarks[JointName.RIGHT_ELBOW],
+                landmarks[JointName.RIGHT_SHOULDER],
+                landmarks[JointName.RIGHT_HIP]
+            )
+        else:
+            angles.left_shoulder = 0.0
+            angles.right_shoulder = 0.0
         
         self._last_angles = angles
         return angles
@@ -296,6 +308,8 @@ class BicepCurlModule(BaseExercise):
     
     def _check_body_swing(self, landmarks: dict[JointName, Landmark]) -> bool:
         """Check if body is swinging to generate momentum."""
+        if not self._lower_body_visible(landmarks):
+            return False
         mid_shoulder_x = (landmarks[JointName.LEFT_SHOULDER].x + 
                          landmarks[JointName.RIGHT_SHOULDER].x) / 2
         mid_shoulder_y = (landmarks[JointName.LEFT_SHOULDER].y + 

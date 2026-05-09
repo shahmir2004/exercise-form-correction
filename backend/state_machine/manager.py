@@ -75,6 +75,7 @@ class FormManagerState:
     stable_violations: list = field(default_factory=list)
     exercise_variant: Optional[str] = None
     exercise_source: str = "hmm"
+    camera_view: str = "unknown"
     is_stationary: bool = False
     time_in_state: float = 0.0
     frames_processed: int = 0
@@ -139,6 +140,7 @@ class FormManager:
         # 3. Feature extraction
         vis = validated.landmarks[:, 3]
         frame = self._feature_extractor.extract(smoothed_xyz, uncertainty, vis)
+        self._last_camera_view = frame.view_estimate.value
 
         # 4. HMM classification (single classifier)
         hmm_result = self._hmm.update(frame)
@@ -220,7 +222,7 @@ class FormManager:
                 self._form_evaluator.reset()
 
         # 7. Confidence composition (before switching, for quality gating)
-        ex_name = _EX_TYPE_TO_NAME.get(self._current_exercise)
+        ex_name = _EX_TYPE_TO_NAME.get(candidate_exercise or self._current_exercise)
         conf_result = self._confidence_composer.compose(
             candidate_conf, frame, validated.quality_flags, ex_name
         )
@@ -419,18 +421,25 @@ class FormManager:
         avg_knee = (left_knee + right_knee) / 2.0
         min_elbow = min(left_elbow, right_elbow)
         elbow_asym = abs(left_elbow - right_elbow)
+        vis = getattr(frame, "visibility", np.ones(33))
+        arm_vis = min(float(vis[11]), float(vis[12]), float(vis[13]),
+                      float(vis[14]), float(vis[15]), float(vis[16]))
+        lower_vis = min(float(vis[23]), float(vis[24]), float(vis[25]),
+                        float(vis[26]), float(vis[27]), float(vis[28]))
 
         if frame.is_horizontal:
             elbow_signal = 1.0 if min_elbow < 150.0 else 0.55
             return ExerciseType.PUSHUP, min(0.98, 0.78 + 0.12 * elbow_signal)
 
-        squat_like = avg_knee < 135.0 and min_elbow > 135.0 and frame.hip_y > 0.55
+        squat_like = lower_vis >= 0.3 and avg_knee < 135.0 and frame.hip_y > 0.55
         if squat_like:
             depth_score = min(1.0, max(0.0, (135.0 - avg_knee) / 55.0))
             hip_score = min(1.0, max(0.0, (frame.hip_y - 0.55) / 0.20))
             return ExerciseType.SQUAT, min(0.96, 0.70 + 0.16 * depth_score + 0.08 * hip_score)
 
-        curl_like = min_elbow < 145.0 and torso < 55.0
+        hips_visible = min(float(vis[23]), float(vis[24])) >= 0.3
+        torso_ok = torso < 55.0 if hips_visible else True
+        curl_like = arm_vis >= 0.3 and min_elbow < 145.0 and torso_ok
         if curl_like:
             if elbow_asym > 28.0 or frame.arm_phase_diff < -0.25:
                 return ExerciseType.ALTERNATE_BICEP_CURL, 0.74
@@ -534,6 +543,7 @@ class FormManager:
             stable_violations=stable_violations,
             exercise_variant=self._current_variant,
             exercise_source=self._exercise_source,
+            camera_view=getattr(self, "_last_camera_view", "unknown"),
             is_stationary=self._is_stationary,
             time_in_state=time.time() - self._state_start_time,
             frames_processed=self._frames_processed,

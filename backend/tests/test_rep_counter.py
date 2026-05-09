@@ -1,7 +1,23 @@
 from exercises.bicep_curl import BicepCurlModule, AlternateBicepCurlModule
 from exercises.pushup import PushupModule
 from exercises.squat import SquatModule
+import pipeline.rep_counter as rep_counter_module
 from pipeline.rep_counter import HysteresisRepCounter
+
+
+def _feed_at_20fps(monkeypatch, counter, angles):
+    now = 1000.0
+    phases = []
+    completed = 0
+
+    for angle in angles:
+        now += 0.05
+        monkeypatch.setattr(rep_counter_module.time, "time", lambda t=now: t)
+        phase, done = counter.update(angle, visibility=1.0)
+        phases.append(phase.value)
+        completed += int(done)
+
+    return phases, completed
 
 
 def test_squat_counter_counts_full_cycles_with_eccentric_concentric_phases():
@@ -18,6 +34,47 @@ def test_squat_counter_counts_full_cycles_with_eccentric_concentric_phases():
     assert completed == 5
     assert "eccentric" in phases
     assert "concentric" in phases
+
+
+def test_phase_settles_to_hold_during_noisy_top_position(monkeypatch):
+    counter = HysteresisRepCounter(
+        upper_threshold=150,
+        lower_threshold=90,
+        min_rep_duration=0,
+        smooth_window=7,
+    )
+    angles = [
+        170, 168, 165, 155,
+        135, 110, 85,
+        100, 125, 145, 158,
+        160, 159, 161, 160, 162, 159, 161, 160, 160, 161,
+    ]
+
+    phases, completed = _feed_at_20fps(monkeypatch, counter, angles)
+    top_phases = phases[-8:]
+
+    assert completed == 1
+    assert top_phases[-4:] == ["hold", "hold", "hold", "hold"]
+    assert len(set(top_phases)) <= 2
+
+
+def test_standing_still_jitter_does_not_emit_movement_phases(monkeypatch):
+    counter = HysteresisRepCounter(
+        upper_threshold=150,
+        lower_threshold=90,
+        min_rep_duration=0,
+        smooth_window=7,
+    )
+    angles = [
+        128, 132, 127, 134, 129, 133, 128, 131, 135, 128,
+        132, 129, 134, 127, 131, 133, 128, 134, 129, 132,
+    ]
+
+    phases, completed = _feed_at_20fps(monkeypatch, counter, angles)
+    settled_phases = phases[7:]
+
+    assert completed == 0
+    assert set(settled_phases) <= {"setup", "hold"}
 
 
 def test_partial_reps_and_threshold_jitter_do_not_increment():

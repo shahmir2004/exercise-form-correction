@@ -74,12 +74,14 @@ _DEFAULT_MIN_REP_FRAMES = 8         # peak-to-peak minimum distance
 # Velocity thresholds for phase output (degrees / second).
 _VELOCITY_HOLD_THRESHOLD = 8.0
 _VELOCITY_DIR_THRESHOLD = 4.0
+_PHASE_STILL_RANGE_DEGREES = 15.0
+_PHASE_ENDPOINT_MARGIN_DEGREES = 8.0
 
 # Visibility-based abort. The previous "3 frames < 0.3" rule killed reps on
 # transient occlusion; this version requires a longer streak at a stricter
 # threshold AND a per-rep minimum, so single bad frames never poison a rep.
 _VISIBILITY_ABORT_THRESHOLD = 0.2
-_VISIBILITY_ABORT_FRAMES = 6
+_VISIBILITY_ABORT_FRAMES = 4
 _VISIBILITY_REP_MIN = 0.25
 
 
@@ -150,6 +152,10 @@ class HysteresisRepCounter:
         self._pending_trough_min_vis: float = 1.0
         self._last_peak_value: Optional[float] = None
         self._last_peak_time: Optional[float] = None
+        self._threshold_in_rep: bool = False
+        self._threshold_start_time: Optional[float] = None
+        self._threshold_min_angle: float = 180.0
+        self._threshold_min_vis: float = 1.0
 
         # Output state.
         self._phase: RepPhase = RepPhase.IDLE
@@ -196,11 +202,10 @@ class HysteresisRepCounter:
         if visibility is not None:
             if visibility < _VISIBILITY_ABORT_THRESHOLD:
                 self._low_visibility_streak += 1
-                if (
-                    self._low_visibility_streak >= _VISIBILITY_ABORT_FRAMES
-                    and self._pending_trough_idx is not None
-                ):
+                if self._low_visibility_streak >= _VISIBILITY_ABORT_FRAMES:
                     self._pending_trough_idx = None
+                    self._threshold_in_rep = False
+                    self._threshold_start_time = None
                     self._phase = RepPhase.READY
             else:
                 self._low_visibility_streak = 0
@@ -213,7 +218,7 @@ class HysteresisRepCounter:
             self._velocity_dps = 0.0
             if self._phase == RepPhase.IDLE:
                 self._phase = RepPhase.READY
-            return self._phase, False
+            return self._phase, self._scan_threshold_rep(float(angle), now)
 
         arr = np.fromiter(self._angles, dtype=float)
         ts_arr = np.fromiter(self._timestamps, dtype=float)
@@ -234,9 +239,29 @@ class HysteresisRepCounter:
         self._smoothed_angle = float(smoothed[-1])
         self._velocity_dps = float(velocity_per_sample[-1]) / max(mean_dt, 1e-3)
 
-        # Phase from velocity sign with a small "hold" band to suppress jitter.
+        # Phase from velocity sign, with endpoint stillness checked first.
+        # At top/bottom, tiny landmark jitter can create alternating velocity
+        # signs even though the body is effectively holding position.
         v = self._velocity_dps
-        if abs(v) < _VELOCITY_HOLD_THRESHOLD:
+        phase_win = min(self.smooth_window, len(smoothed))
+        recent_range = float(np.ptp(smoothed[-phase_win:])) if phase_win > 1 else 0.0
+        near_top = self._smoothed_angle >= self.upper_threshold - _PHASE_ENDPOINT_MARGIN_DEGREES
+        near_bottom = self._smoothed_angle <= self.lower_threshold + _PHASE_ENDPOINT_MARGIN_DEGREES
+        raw_near_top = float(angle) >= self.upper_threshold - _PHASE_ENDPOINT_MARGIN_DEGREES
+        raw_near_bottom = float(angle) <= self.lower_threshold + _PHASE_ENDPOINT_MARGIN_DEGREES
+        is_latched_top_hold = raw_near_top and near_top and self._phase in {
+            RepPhase.CONCENTRIC,
+            RepPhase.HOLD,
+        }
+        is_latched_bottom_hold = raw_near_bottom and near_bottom and self._phase in {
+            RepPhase.ECCENTRIC,
+            RepPhase.HOLD,
+        }
+        if is_latched_top_hold or is_latched_bottom_hold:
+            new_phase = RepPhase.HOLD
+        elif recent_range <= _PHASE_STILL_RANGE_DEGREES:
+            new_phase = RepPhase.HOLD if self._phase != RepPhase.IDLE else RepPhase.READY
+        elif abs(v) < _VELOCITY_HOLD_THRESHOLD:
             new_phase = RepPhase.HOLD if self._phase != RepPhase.IDLE else RepPhase.READY
         elif v < -_VELOCITY_DIR_THRESHOLD:
             new_phase = RepPhase.ECCENTRIC
@@ -246,6 +271,10 @@ class HysteresisRepCounter:
             new_phase = self._phase if self._phase != RepPhase.IDLE else RepPhase.READY
         self._phase = new_phase
 
+        rep_completed = self._scan_threshold_rep(float(angle), now)
+        if rep_completed:
+            return self._phase, True
+
         rep_completed = self._scan_for_completed_rep(smoothed, ts_arr)
         # Plateau finalizer: if a rep ended at a sustained "hold at top" the
         # smoothed signal rises into a plateau without a descent — find_peaks
@@ -254,6 +283,68 @@ class HysteresisRepCounter:
         if not rep_completed and self._pending_trough_idx is not None:
             rep_completed = self._maybe_finalize_plateau_rep(smoothed, ts_arr)
         return self._phase, rep_completed
+
+    def _scan_threshold_rep(self, angle: float, now: float) -> bool:
+        """Fast Schmitt-style fallback for short, clean rep cycles.
+
+        The peak detector is still useful for noisy real motion, but it can
+        miss exhibition-speed cycles when there are too few samples around the
+        peak/trough. This fallback counts a clear lower-threshold crossing
+        followed by a full return to the upper threshold.
+        """
+        current_vis = float(self._visibilities[-1]) if self._visibilities else 1.0
+
+        if not self._threshold_in_rep and angle <= self.lower_threshold:
+            self._threshold_in_rep = True
+            self._threshold_start_time = now
+            self._threshold_min_angle = angle
+            self._threshold_min_vis = current_vis
+            return False
+
+        if not self._threshold_in_rep:
+            return False
+
+        self._threshold_min_angle = min(self._threshold_min_angle, angle)
+        self._threshold_min_vis = min(self._threshold_min_vis, current_vis)
+
+        if angle < self.upper_threshold:
+            return False
+
+        start_time = self._threshold_start_time or now
+        duration = now - start_time
+        trough_value = self._threshold_min_angle
+        peak_value = angle
+
+        self._threshold_in_rep = False
+        self._threshold_start_time = None
+
+        if not self._is_valid_rep(
+            duration=duration,
+            peak_value=peak_value,
+            trough_value=trough_value,
+            min_vis=self._threshold_min_vis,
+        ):
+            self._partial_rep_count += 1
+            return False
+
+        self._rep_count += 1
+        self._reps.append(
+            RepData(
+                rep_number=self._rep_count,
+                quality=self._calculate_rep_quality(
+                    duration, peak_value, trough_value
+                ),
+                duration_seconds=duration,
+                min_angle=trough_value,
+                max_angle=peak_value,
+            )
+        )
+        self._last_peak_idx = self._frame_idx
+        self._last_peak_value = peak_value
+        self._last_peak_time = now
+        self._pending_trough_idx = None
+        self._form_violations = []
+        return True
 
     def _maybe_finalize_plateau_rep(
         self, smoothed: np.ndarray, ts_arr: np.ndarray
@@ -506,6 +597,10 @@ class HysteresisRepCounter:
         self._pending_trough_min_vis = 1.0
         self._last_peak_value = None
         self._last_peak_time = None
+        self._threshold_in_rep = False
+        self._threshold_start_time = None
+        self._threshold_min_angle = 180.0
+        self._threshold_min_vis = 1.0
         self._reps.clear()
         self._form_violations.clear()
         self._low_visibility_streak = 0

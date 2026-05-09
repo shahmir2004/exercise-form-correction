@@ -16,6 +16,7 @@ from state_machine.manager import FormManager, SystemState
 router = APIRouter()
 logger = logging.getLogger(__name__)
 _CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
+_CAMERA_VIEW_CHOICES = {"auto", "front", "side", "three_quarter"}
 
 
 class FormCorrectionResponse(BaseModel):
@@ -39,6 +40,7 @@ class FormCorrectionResponse(BaseModel):
     signal_quality: str = "good"
     exercise_variant: Optional[str] = None
     exercise_source: str = "hmm"
+    camera_view: str = "unknown"
 
 
 class ConnectionManager:
@@ -107,6 +109,7 @@ async def pose_websocket(websocket: WebSocket, client_id: str):
             timestamp = data.get("timestamp", 0)
 
             state = form_manager.process_frame(landmarks)
+            camera_view = _resolve_camera_view(data.get("camera_view"), state.camera_view)
 
             result = state.exercise_result
             response = FormCorrectionResponse(
@@ -129,6 +132,7 @@ async def pose_websocket(websocket: WebSocket, client_id: str):
                 signal_quality=state.signal_quality,
                 exercise_variant=state.exercise_variant,
                 exercise_source=state.exercise_source,
+                camera_view=camera_view,
             )
 
             await manager.send_response(client_id, response)
@@ -148,6 +152,14 @@ def _build_correction_message(result) -> str:
             return "Great form! Keep it up!"
         return ""
     return result.corrections[0] if result.corrections else ""
+
+
+def _resolve_camera_view(requested_view, estimated_view: str) -> str:
+    if isinstance(requested_view, str):
+        normalized = requested_view.strip().lower()
+        if normalized in _CAMERA_VIEW_CHOICES and normalized != "auto":
+            return normalized
+    return estimated_view or "unknown"
 
 
 @router.get("/health")

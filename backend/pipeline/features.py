@@ -36,6 +36,7 @@ class BodyFrame:
     angles: dict = field(default_factory=dict)
     # Per-landmark uncertainty from Kalman (trace of position covariance)
     uncertainty: np.ndarray = field(default_factory=lambda: np.zeros(33))
+    visibility: np.ndarray = field(default_factory=lambda: np.ones(33))
     # View classification
     view_estimate: ViewEstimate = ViewEstimate.UNKNOWN
     # Torso length in original units (for reference)
@@ -218,6 +219,7 @@ class FeatureExtractor:
             coords=coords,
             angles=angles,
             uncertainty=uncertainty.copy(),
+            visibility=original_vis.copy(),
             view_estimate=view,
             torso_length=torso_length,
             is_horizontal=is_horizontal,

@@ -13,6 +13,7 @@ def _frame(angles, *, is_horizontal=False, hip_y=0.6, arm_phase_diff=0.0):
         coords=np.zeros((33, 3)),
         angles=angles,
         uncertainty=np.zeros(33),
+        visibility=np.ones(33),
         view_estimate=ViewEstimate.FRONTAL,
         is_horizontal=is_horizontal,
         torso_length=1.0,
@@ -66,6 +67,32 @@ def test_squat_rule_gate_overrides_missing_library_curl_bias():
         squat_frame,
         ExerciseType.BICEP_CURL,
         0.55,
+        "hmm",
+    )
+
+    assert exercise == ExerciseType.SQUAT
+    assert confidence >= 0.72
+    assert source == "rule_gate"
+
+
+def test_squat_rule_gate_allows_bent_hands_in_front():
+    manager = FormManager()
+    squat_frame = _frame(
+        {
+            "left_knee": 88,
+            "right_knee": 94,
+            "left_elbow": 82,
+            "right_elbow": 88,
+            "torso_angle": 22,
+        },
+        is_horizontal=False,
+        hip_y=0.72,
+    )
+
+    exercise, confidence, source = manager._apply_rule_gate(
+        squat_frame,
+        ExerciseType.BICEP_CURL,
+        0.61,
         "hmm",
     )
 
