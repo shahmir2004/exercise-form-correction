@@ -1,33 +1,41 @@
 """
-Rep counting via signal processing — Savitzky-Golay smoothing + scipy.find_peaks.
+Rep counting via a simple Schmitt-trigger on the exercise's primary joint angle.
 
-Replaces the previous Schmitt-trigger threshold logic with a denoise-then-find-peaks
-pipeline. Public API is preserved, so callers (`exercises/*.py`,
-`state_machine/manager.py`) continue to work unchanged.
+A rep is one full flex-extend cycle on that single angle:
+  extend zone  ->  flex zone  ->  extend zone   == 1 rep
 
-Phase output is derived from the smoothed angle's first derivative; a single
-noisy frame near a threshold no longer flips the phase.
+Hysteresis bands at each end (a configurable fraction of the upper-lower
+range) prevent jitter from double-counting near the thresholds. A light EMA
+smooths landmark noise without adding latency. No find_peaks, no
+Savitzky-Golay, no global frame indices, no plateau finalizers — those were
+the moving parts that kept rejecting reps in practice. This counter only
+cares about the angle the exercise module hands it.
+
+Public surface preserved (all callers in exercises/*.py and state_machine
+keep working unchanged):
+  - constructor: upper_threshold, lower_threshold, min_rep_duration,
+    max_rep_duration, require_full_extension, smooth_window, polyorder,
+    prominence, min_rep_frames
+  - update(angle, left_angle, right_angle, form_violations, visibility)
+    -> (RepPhase, rep_completed: bool)
+  - record_violations(list), reset()
+  - rep_count, partial_reps, phase, phase_str, last_rep, average_quality,
+    smoothed_angle, velocity_dps
 """
 
+from collections import deque
 from enum import Enum
 from dataclasses import dataclass, field
 from typing import Any, Optional
-from collections import deque
 import time
-
-import numpy as np
-from scipy.signal import savgol_filter, find_peaks
 
 
 class RepPhase(str, Enum):
     """Mechanical rep counter phase, semantic to angle direction.
 
-    ECCENTRIC = angle moving toward lower threshold (joint flexing).
-    CONCENTRIC = angle moving toward upper threshold (joint extending).
-
-    Each exercise module maps these mechanical phases to user-facing
-    eccentric/concentric labels — for squat/pushup the mapping is identity;
-    for bicep curl the mapping is swapped (flexion = concentric of the lift).
+    ECCENTRIC = angle decreasing (joint flexing).
+    CONCENTRIC = angle increasing (joint extending).
+    Each exercise module maps these to user-facing labels.
     """
     IDLE = "idle"
     READY = "setup"
@@ -47,10 +55,10 @@ class RepQuality:
     @property
     def overall_score(self) -> float:
         return (
-            self.form_score * 0.4 +
-            self.depth_score * 0.3 +
-            self.tempo_score * 0.15 +
-            self.symmetry_score * 0.15
+            self.form_score * 0.4
+            + self.depth_score * 0.3
+            + self.tempo_score * 0.15
+            + self.symmetry_score * 0.15
         )
 
 
@@ -64,54 +72,67 @@ class RepData:
     timestamp: float = field(default_factory=time.time)
 
 
-# Defaults; per-exercise overrides come from settings.REP_DETECTION via the
-# exercise modules' constructor flow (see exercises/base.py:_create_rep_counter).
-_DEFAULT_SMOOTH_WINDOW = 9
-_DEFAULT_POLYORDER = 3
-_DEFAULT_PROMINENCE = 25.0          # degrees
-_DEFAULT_MIN_REP_FRAMES = 8         # peak-to-peak minimum distance
+# Hysteresis band depth as a fraction of (upper - lower). 0.40 means the
+# extend zone covers the top 40% and the flex zone covers the bottom 40%;
+# the middle 20% is the dead zone. Wide bands let partial-range reps count
+# while still demanding a clear flex-extend cycle to trip both edges.
+_BAND_RATIO = 0.40
 
-# Velocity thresholds for phase output (degrees / second).
-_VELOCITY_HOLD_THRESHOLD = 8.0
-_VELOCITY_DIR_THRESHOLD = 4.0
-_PHASE_STILL_RANGE_DEGREES = 15.0
-_PHASE_ENDPOINT_MARGIN_DEGREES = 8.0
+# Minimum ROM as a fraction of (upper - lower). 0.25 keeps shallow but real
+# reps countable while rejecting jitter that never crosses both bands.
+_MIN_ROM_RATIO = 0.25
 
-# Visibility-based abort. The previous "3 frames < 0.3" rule killed reps on
-# transient occlusion; this version requires a longer streak at a stricter
-# threshold AND a per-rep minimum, so single bad frames never poison a rep.
-_VISIBILITY_ABORT_THRESHOLD = 0.2
-_VISIBILITY_ABORT_FRAMES = 4
-_VISIBILITY_REP_MIN = 0.25
+# Light EMA on the raw angle. 0.45 keeps reaction within ~2 frames at 20fps.
+_EMA_DECAY = 0.45
+
+# Velocity thresholds (degrees / second) for phase output. Velocity itself
+# is smoothed by an EMA before comparison so single-frame jitter doesn't
+# flip the phase between hold/eccentric/concentric.
+_VELOCITY_HOLD_THRESHOLD = 12.0
+_VELOCITY_DIR_THRESHOLD = 6.0
+_VELOCITY_EMA_DECAY = 0.6
+
+# Stillness check window: if the smoothed angle's peak-to-peak range over
+# the last N frames is below this many degrees, force a HOLD output even
+# if instantaneous velocity briefly spikes from landmark jitter.
+_STILL_WINDOW_FRAMES = 10
+_STILL_RANGE_DEGREES = 12.0
+
+# Minimum visibility for a rep to count. Set low enough that transient
+# occlusions don't kill reps but high enough that completely unreliable
+# frames are rejected.
+_VISIBILITY_REP_MIN = 0.2
 
 
 class HysteresisRepCounter:
-    """Drop-in rep counter — same public surface as before, smarter internals.
+    """Schmitt-trigger rep counter on a single primary angle.
 
-    Public surface preserved:
-      - constructor: upper_threshold, lower_threshold, min_rep_duration,
-        max_rep_duration, require_full_extension
-      - .update(angle, left_angle, right_angle, form_violations, visibility)
-        -> (RepPhase, rep_completed: bool)
-      - .rep_count, .partial_reps, .phase, .phase_str, .last_rep,
-        .average_quality, .reset(), .record_violations()
+    States visited in order for one rep:
+        EXTEND zone  ->  (between)  ->  FLEX zone  ->  (between)  ->  EXTEND zone
 
-    New optional kwargs (with sensible defaults so existing call sites keep
-    working): smooth_window, polyorder, prominence, min_rep_frames.
+    The flex zone is angle <= lower_threshold + band_depth.
+    The extend zone is angle >= upper_threshold - band_depth.
+    Anything in between leaves the state unchanged (the dead zone).
+
+    A rep is finalized at the moment the angle re-enters the extend zone after
+    having been in the flex zone. Min/max angles within the rep are tracked
+    from the smoothed signal so quality reflects the user's actual ROM.
     """
 
     def __init__(
         self,
         upper_threshold: float,
         lower_threshold: float,
-        min_rep_duration: float = 0.5,
+        min_rep_duration: float = 0.4,
         max_rep_duration: float = 10.0,
-        require_full_extension: bool = True,
+        require_full_extension: bool = False,
         *,
-        smooth_window: int = _DEFAULT_SMOOTH_WINDOW,
-        polyorder: int = _DEFAULT_POLYORDER,
-        prominence: float = _DEFAULT_PROMINENCE,
-        min_rep_frames: int = _DEFAULT_MIN_REP_FRAMES,
+        # Legacy kwargs preserved so existing call sites don't break. Not used
+        # by the simple Schmitt-trigger algorithm — all are accepted silently.
+        smooth_window: int = 9,
+        polyorder: int = 3,
+        prominence: float = 25.0,
+        min_rep_frames: int = 8,
     ):
         self.upper_threshold = float(upper_threshold)
         self.lower_threshold = float(lower_threshold)
@@ -119,45 +140,35 @@ class HysteresisRepCounter:
         self.max_rep_duration = float(max_rep_duration)
         self.require_full_extension = bool(require_full_extension)
 
-        # savgol_filter requires an odd window strictly greater than polyorder.
-        sw = int(smooth_window)
-        if sw % 2 == 0:
-            sw += 1
-        po = int(polyorder)
-        if po >= sw:
-            po = sw - 1
-        self.smooth_window = sw
-        self.polyorder = po
+        # Legacy kwargs kept on the instance for callers that read them.
+        self.smooth_window = int(smooth_window)
+        self.polyorder = int(polyorder)
         self.prominence = float(prominence)
-        self.min_rep_frames = max(2, int(min_rep_frames))
+        self.min_rep_frames = int(min_rep_frames)
 
-        # Rolling buffer ~3s @ 20fps so find_peaks has room to register a full
-        # cycle even after smoothing-edge effects.
-        self._buffer_size = max(60, self.smooth_window * 6)
-        self._angles: deque = deque(maxlen=self._buffer_size)
-        self._timestamps: deque = deque(maxlen=self._buffer_size)
-        self._visibilities: deque = deque(maxlen=self._buffer_size)
+        rng = max(1.0, self.upper_threshold - self.lower_threshold)
+        band = _BAND_RATIO * rng
+        # Zone thresholds.
+        self._flex_zone_max = self.lower_threshold + band     # angle <= this -> flex zone
+        self._extend_zone_min = self.upper_threshold - band   # angle >= this -> extend zone
+        # Minimum ROM to consider the cycle a real rep.
+        self._min_rom = _MIN_ROM_RATIO * rng
 
-        # Monotonic global frame index — survives buffer rotation so we can
-        # tell whether a peak/trough returned by find_peaks is one we've
-        # already counted.
-        self._frame_idx: int = 0
-        self._buffer_start_idx: int = 0  # global idx of self._angles[0]
+        self._reset_state()
 
-        # Pending-rep bookkeeping.
-        self._last_trough_idx: int = -1
-        self._last_peak_idx: int = -1
-        self._pending_trough_idx: Optional[int] = None
-        self._pending_trough_value: float = 180.0
-        self._pending_trough_min_vis: float = 1.0
-        self._last_peak_value: Optional[float] = None
-        self._last_peak_time: Optional[float] = None
-        self._threshold_in_rep: bool = False
-        self._threshold_start_time: Optional[float] = None
-        self._threshold_min_angle: float = 180.0
-        self._threshold_min_vis: float = 1.0
+    def _reset_state(self) -> None:
+        self._ema_angle: Optional[float] = None
+        if hasattr(self, "_recent_smoothed"):
+            self._recent_smoothed.clear()
+        self._has_seen_extend: bool = False
+        self._in_flex_phase: bool = False
+        self._flex_start_time: Optional[float] = None
+        self._flex_min_angle: float = 180.0
+        self._flex_min_visibility: float = 1.0
+        self._extend_max_angle: float = 0.0
+        self._last_smoothed: Optional[float] = None
+        self._last_update_time: Optional[float] = None
 
-        # Output state.
         self._phase: RepPhase = RepPhase.IDLE
         self._rep_count: int = 0
         self._partial_rep_count: int = 0
@@ -165,11 +176,9 @@ class HysteresisRepCounter:
         self._form_violations: list[str] = []
         self._left_angle: float = 0.0
         self._right_angle: float = 0.0
-        self._low_visibility_streak: int = 0
-
-        # Cached for callers that want to inspect the smoothed signal.
-        self._smoothed_angle: float = 0.0
         self._velocity_dps: float = 0.0
+        self._velocity_ema: float = 0.0
+        self._recent_smoothed: deque = deque(maxlen=_STILL_WINDOW_FRAMES)
 
     def update(
         self,
@@ -180,15 +189,27 @@ class HysteresisRepCounter:
         visibility: Optional[float] = None,
     ) -> tuple[RepPhase, bool]:
         now = time.time()
-        self._frame_idx += 1
-        # Track which global frame index now corresponds to buffer[0].
-        if len(self._angles) == self._buffer_size:
-            self._buffer_start_idx += 1
-        elif len(self._angles) == 0:
-            self._buffer_start_idx = self._frame_idx
-        self._angles.append(float(angle))
-        self._timestamps.append(now)
-        self._visibilities.append(float(visibility) if visibility is not None else 1.0)
+        a = float(angle)
+
+        # Light EMA smoothing on the raw angle.
+        if self._ema_angle is None:
+            self._ema_angle = a
+        else:
+            d = _EMA_DECAY
+            self._ema_angle = d * self._ema_angle + (1.0 - d) * a
+        smoothed = self._ema_angle
+
+        # Velocity in degrees/second from smoothed signal, then EMA the
+        # velocity so single-frame jitter doesn't flip the phase output.
+        if self._last_update_time is not None and self._last_smoothed is not None:
+            dt = max(now - self._last_update_time, 1e-3)
+            self._velocity_dps = (smoothed - self._last_smoothed) / dt
+            v = _VELOCITY_EMA_DECAY
+            self._velocity_ema = v * self._velocity_ema + (1.0 - v) * self._velocity_dps
+        self._last_update_time = now
+        self._last_smoothed = smoothed
+        self._recent_smoothed.append(smoothed)
+
         if left_angle is not None:
             self._left_angle = float(left_angle)
         if right_angle is not None:
@@ -196,311 +217,101 @@ class HysteresisRepCounter:
         if form_violations:
             self._form_violations.extend(form_violations)
 
-        # Soft visibility-abort: only triggers on a sustained streak at a
-        # stricter threshold than the old logic, so transient occlusion is
-        # tolerated and only true frame-exits kill a pending rep.
-        if visibility is not None:
-            if visibility < _VISIBILITY_ABORT_THRESHOLD:
-                self._low_visibility_streak += 1
-                if self._low_visibility_streak >= _VISIBILITY_ABORT_FRAMES:
-                    self._pending_trough_idx = None
-                    self._threshold_in_rep = False
-                    self._threshold_start_time = None
-                    self._phase = RepPhase.READY
-            else:
-                self._low_visibility_streak = 0
+        vis = float(visibility) if visibility is not None else 1.0
 
-        # Until the smoothing window is full, fall back to a simple "engaged"
-        # output so the upstream UI sees a phase string. No reps can be
-        # counted until we have at least one full smoothing window of data.
-        if len(self._angles) < self.smooth_window:
-            self._smoothed_angle = float(angle)
-            self._velocity_dps = 0.0
-            if self._phase == RepPhase.IDLE:
-                self._phase = RepPhase.READY
-            return self._phase, self._scan_threshold_rep(float(angle), now)
-
-        arr = np.fromiter(self._angles, dtype=float)
-        ts_arr = np.fromiter(self._timestamps, dtype=float)
-
-        smoothed = savgol_filter(
-            arr, window_length=self.smooth_window, polyorder=self.polyorder
-        )
-        velocity_per_sample = savgol_filter(
-            arr,
-            window_length=self.smooth_window,
-            polyorder=self.polyorder,
-            deriv=1,
-        )
-        # Convert deg/sample to deg/second using the local mean dt.
-        win = min(self.smooth_window, len(ts_arr))
-        dts = np.diff(ts_arr[-win:])
-        mean_dt = float(np.mean(dts)) if dts.size > 0 and float(np.mean(dts)) > 0 else 1.0 / 20.0
-        self._smoothed_angle = float(smoothed[-1])
-        self._velocity_dps = float(velocity_per_sample[-1]) / max(mean_dt, 1e-3)
-
-        # Phase from velocity sign, with endpoint stillness checked first.
-        # At top/bottom, tiny landmark jitter can create alternating velocity
-        # signs even though the body is effectively holding position.
-        v = self._velocity_dps
-        phase_win = min(self.smooth_window, len(smoothed))
-        recent_range = float(np.ptp(smoothed[-phase_win:])) if phase_win > 1 else 0.0
-        near_top = self._smoothed_angle >= self.upper_threshold - _PHASE_ENDPOINT_MARGIN_DEGREES
-        near_bottom = self._smoothed_angle <= self.lower_threshold + _PHASE_ENDPOINT_MARGIN_DEGREES
-        raw_near_top = float(angle) >= self.upper_threshold - _PHASE_ENDPOINT_MARGIN_DEGREES
-        raw_near_bottom = float(angle) <= self.lower_threshold + _PHASE_ENDPOINT_MARGIN_DEGREES
-        is_latched_top_hold = raw_near_top and near_top and self._phase in {
-            RepPhase.CONCENTRIC,
-            RepPhase.HOLD,
-        }
-        is_latched_bottom_hold = raw_near_bottom and near_bottom and self._phase in {
-            RepPhase.ECCENTRIC,
-            RepPhase.HOLD,
-        }
-        if is_latched_top_hold or is_latched_bottom_hold:
-            new_phase = RepPhase.HOLD
-        elif recent_range <= _PHASE_STILL_RANGE_DEGREES:
-            new_phase = RepPhase.HOLD if self._phase != RepPhase.IDLE else RepPhase.READY
-        elif abs(v) < _VELOCITY_HOLD_THRESHOLD:
-            new_phase = RepPhase.HOLD if self._phase != RepPhase.IDLE else RepPhase.READY
-        elif v < -_VELOCITY_DIR_THRESHOLD:
-            new_phase = RepPhase.ECCENTRIC
-        elif v > _VELOCITY_DIR_THRESHOLD:
-            new_phase = RepPhase.CONCENTRIC
+        # Classify zone with hysteresis.
+        if smoothed >= self._extend_zone_min:
+            zone = "extend"
+        elif smoothed <= self._flex_zone_max:
+            zone = "flex"
         else:
-            new_phase = self._phase if self._phase != RepPhase.IDLE else RepPhase.READY
-        self._phase = new_phase
+            zone = "between"
 
-        rep_completed = self._scan_threshold_rep(float(angle), now)
-        if rep_completed:
-            return self._phase, True
-
-        rep_completed = self._scan_for_completed_rep(smoothed, ts_arr)
-        # Plateau finalizer: if a rep ended at a sustained "hold at top" the
-        # smoothed signal rises into a plateau without a descent — find_peaks
-        # cannot register a peak there. Detect rising→plateau as a rep end
-        # so the last rep of a set isn't dropped.
-        if not rep_completed and self._pending_trough_idx is not None:
-            rep_completed = self._maybe_finalize_plateau_rep(smoothed, ts_arr)
-        return self._phase, rep_completed
-
-    def _scan_threshold_rep(self, angle: float, now: float) -> bool:
-        """Fast Schmitt-style fallback for short, clean rep cycles.
-
-        The peak detector is still useful for noisy real motion, but it can
-        miss exhibition-speed cycles when there are too few samples around the
-        peak/trough. This fallback counts a clear lower-threshold crossing
-        followed by a full return to the upper threshold.
-        """
-        current_vis = float(self._visibilities[-1]) if self._visibilities else 1.0
-
-        if not self._threshold_in_rep and angle <= self.lower_threshold:
-            self._threshold_in_rep = True
-            self._threshold_start_time = now
-            self._threshold_min_angle = angle
-            self._threshold_min_vis = current_vis
-            return False
-
-        if not self._threshold_in_rep:
-            return False
-
-        self._threshold_min_angle = min(self._threshold_min_angle, angle)
-        self._threshold_min_vis = min(self._threshold_min_vis, current_vis)
-
-        if angle < self.upper_threshold:
-            return False
-
-        start_time = self._threshold_start_time or now
-        duration = now - start_time
-        trough_value = self._threshold_min_angle
-        peak_value = angle
-
-        self._threshold_in_rep = False
-        self._threshold_start_time = None
-
-        if not self._is_valid_rep(
-            duration=duration,
-            peak_value=peak_value,
-            trough_value=trough_value,
-            min_vis=self._threshold_min_vis,
-        ):
-            self._partial_rep_count += 1
-            return False
-
-        self._rep_count += 1
-        self._reps.append(
-            RepData(
-                rep_number=self._rep_count,
-                quality=self._calculate_rep_quality(
-                    duration, peak_value, trough_value
-                ),
-                duration_seconds=duration,
-                min_angle=trough_value,
-                max_angle=peak_value,
-            )
-        )
-        self._last_peak_idx = self._frame_idx
-        self._last_peak_value = peak_value
-        self._last_peak_time = now
-        self._pending_trough_idx = None
-        self._form_violations = []
-        return True
-
-    def _maybe_finalize_plateau_rep(
-        self, smoothed: np.ndarray, ts_arr: np.ndarray
-    ) -> bool:
-        """Close out a rep when velocity decays from positive to ~0 with the
-        smoothed angle past upper_threshold.
-
-        Triggered when the user holds at the top of the rep (e.g. end of a set
-        or brief pause between reps where they don't fully reset).
-        """
-        if abs(self._velocity_dps) > _VELOCITY_HOLD_THRESHOLD * 0.6:
-            return False
-        if self._smoothed_angle < self.upper_threshold:
-            return False
-        # Confirm there was a clear rising trend in the recent window.
-        win = min(self.smooth_window, len(smoothed) - 1)
-        if win < 3:
-            return False
-        recent_delta = float(smoothed[-1] - smoothed[-win - 1])
-        if recent_delta < self.prominence * 0.5:
-            return False
-
-        # Use the current frame's smoothed angle / time as the peak.
-        peak_value = float(self._smoothed_angle)
-        peak_time = float(ts_arr[-1])
-        peak_global = self._buffer_start_idx + (len(smoothed) - 1)
-        if peak_global <= self._last_peak_idx:
-            return False
-
-        start_time = (
-            self._last_peak_time
-            if self._last_peak_time is not None
-            else float(ts_arr[0])
-        )
-        rep_duration = peak_time - start_time
-
-        if self._is_valid_rep(
-            duration=rep_duration,
-            peak_value=peak_value,
-            trough_value=self._pending_trough_value,
-            min_vis=self._pending_trough_min_vis,
-        ):
-            self._rep_count += 1
-            self._reps.append(
-                RepData(
-                    rep_number=self._rep_count,
-                    quality=self._calculate_rep_quality(
-                        rep_duration, peak_value, self._pending_trough_value
-                    ),
-                    duration_seconds=rep_duration,
-                    min_angle=self._pending_trough_value,
-                    max_angle=peak_value,
-                )
-            )
-            self._last_peak_idx = peak_global
-            self._last_peak_value = peak_value
-            self._last_peak_time = peak_time
-            self._pending_trough_idx = None
-            self._form_violations = []
-            return True
-        return False
-
-    def _scan_for_completed_rep(
-        self, smoothed: np.ndarray, ts_arr: np.ndarray
-    ) -> bool:
-        """Find a newly-completed rep using find_peaks on the smoothed signal.
-
-        A rep = trough (joint flexed) followed by peak (joint extended). We
-        re-run find_peaks every frame; on a 60-sample buffer this is sub-ms.
-        Global frame indices ensure we never count the same trough/peak twice
-        even as the rolling buffer slides.
-        """
-        peaks_local, _ = find_peaks(
-            smoothed,
-            distance=self.min_rep_frames,
-            prominence=self.prominence,
-        )
-        troughs_local, _ = find_peaks(
-            -smoothed,
-            distance=self.min_rep_frames,
-            prominence=self.prominence,
-        )
-
-        # Step 1: register any new trough beyond the last consumed one.
-        for t_local in troughs_local:
-            t_global = self._buffer_start_idx + int(t_local)
-            if t_global <= self._last_trough_idx:
-                continue
-            # Trough must come after the last completed peak — preserves the
-            # alternating peak/trough sequence.
-            if self._last_peak_idx >= 0 and t_global <= self._last_peak_idx:
-                continue
-            self._pending_trough_idx = t_global
-            self._pending_trough_value = float(smoothed[t_local])
-            lo = max(0, int(t_local) - self.smooth_window)
-            hi = min(len(self._visibilities), int(t_local) + self.smooth_window + 1)
-            window_vis = list(self._visibilities)[lo:hi]
-            self._pending_trough_min_vis = (
-                float(min(window_vis)) if window_vis else 1.0
-            )
-            self._last_trough_idx = t_global
-
-        # Step 2: if a trough is pending, look for a subsequent peak.
         rep_completed = False
-        if self._pending_trough_idx is not None:
-            for p_local in peaks_local:
-                p_global = self._buffer_start_idx + int(p_local)
-                if p_global <= self._last_peak_idx:
-                    continue
-                if p_global <= self._pending_trough_idx:
-                    continue
-                peak_value = float(smoothed[p_local])
-                peak_time = float(ts_arr[p_local])
-                start_time = (
-                    self._last_peak_time
-                    if self._last_peak_time is not None
-                    else float(ts_arr[0])
-                )
-                rep_duration = peak_time - start_time
+
+        if zone == "extend":
+            self._has_seen_extend = True
+            self._extend_max_angle = max(self._extend_max_angle, smoothed)
+
+            if self._in_flex_phase and self._flex_start_time is not None:
+                # Rep cycle just closed: flex -> extend.
+                duration = now - self._flex_start_time
+                peak = max(smoothed, self._extend_max_angle)
+                trough = self._flex_min_angle
 
                 if self._is_valid_rep(
-                    duration=rep_duration,
-                    peak_value=peak_value,
-                    trough_value=self._pending_trough_value,
-                    min_vis=self._pending_trough_min_vis,
+                    duration=duration,
+                    peak_value=peak,
+                    trough_value=trough,
+                    min_vis=self._flex_min_visibility,
                 ):
                     self._rep_count += 1
-                    rep_completed = True
-                    quality = self._calculate_rep_quality(
-                        rep_duration, peak_value, self._pending_trough_value
-                    )
                     self._reps.append(
                         RepData(
                             rep_number=self._rep_count,
-                            quality=quality,
-                            duration_seconds=rep_duration,
-                            min_angle=self._pending_trough_value,
-                            max_angle=peak_value,
+                            quality=self._calculate_rep_quality(
+                                duration, peak, trough
+                            ),
+                            duration_seconds=duration,
+                            min_angle=trough,
+                            max_angle=peak,
                         )
                     )
+                    rep_completed = True
                 else:
                     self._partial_rep_count += 1
 
-                self._last_peak_idx = p_global
-                self._last_peak_value = peak_value
-                self._last_peak_time = peak_time
-                self._pending_trough_idx = None
+                # Reset for the next rep.
+                self._in_flex_phase = False
+                self._flex_start_time = None
+                self._flex_min_angle = 180.0
+                self._flex_min_visibility = 1.0
+                self._extend_max_angle = smoothed
                 self._form_violations = []
-                # One rep per update() — multiple new peaks in one frame
-                # would be physically impossible at 20fps anyway.
-                break
 
-        return rep_completed
+        elif zone == "flex":
+            # Only start tracking a rep once we've seen an extension first —
+            # prevents a rep from being counted on initial setup if the user
+            # starts with the joint already flexed.
+            if self._has_seen_extend:
+                if not self._in_flex_phase:
+                    self._in_flex_phase = True
+                    self._flex_start_time = now
+                    self._flex_min_angle = smoothed
+                    self._flex_min_visibility = vis
+                else:
+                    self._flex_min_angle = min(self._flex_min_angle, smoothed)
+                    self._flex_min_visibility = min(self._flex_min_visibility, vis)
 
-    def record_violations(self, violations: list[str]) -> None:
-        self._form_violations.extend(violations)
+        else:
+            # zone == "between"; if we're tracking a flex phase, keep updating
+            # min angle in case the user dwells in the dead zone briefly.
+            if self._in_flex_phase:
+                self._flex_min_angle = min(self._flex_min_angle, smoothed)
+                self._flex_min_visibility = min(self._flex_min_visibility, vis)
+
+        # Phase output for the UI (uses smoothed velocity).
+        self._phase = self._derive_phase(zone, self._velocity_ema)
+
+        return self._phase, rep_completed
+
+    def _derive_phase(self, zone: str, velocity_dps: float) -> RepPhase:
+        # Stillness override: if the most recent frames have a tiny
+        # peak-to-peak range, the body is effectively still — emit HOLD
+        # regardless of any single-frame velocity spike. Only checks the
+        # last few frames so a recent ascent doesn't poison the window.
+        if len(self._recent_smoothed) >= 4:
+            tail = list(self._recent_smoothed)[-5:]
+            recent_range = max(tail) - min(tail)
+            if recent_range <= _STILL_RANGE_DEGREES:
+                return RepPhase.HOLD if self._has_seen_extend else RepPhase.READY
+        if abs(velocity_dps) < _VELOCITY_HOLD_THRESHOLD:
+            return RepPhase.HOLD if self._has_seen_extend else RepPhase.READY
+        if velocity_dps < -_VELOCITY_DIR_THRESHOLD:
+            return RepPhase.ECCENTRIC
+        if velocity_dps > _VELOCITY_DIR_THRESHOLD:
+            return RepPhase.CONCENTRIC
+        return self._phase if self._phase != RepPhase.IDLE else RepPhase.READY
 
     def _is_valid_rep(
         self,
@@ -510,15 +321,20 @@ class HysteresisRepCounter:
         trough_value: float,
         min_vis: float,
     ) -> bool:
-        if duration < self.min_rep_duration or duration > self.max_rep_duration:
+        if duration < self.min_rep_duration:
+            return False
+        if duration > self.max_rep_duration:
+            return False
+        rom = peak_value - trough_value
+        if rom < self._min_rom:
+            return False
+        if min_vis < _VISIBILITY_REP_MIN:
             return False
         if self.require_full_extension:
             if peak_value < self.upper_threshold:
                 return False
             if trough_value > self.lower_threshold:
                 return False
-        if min_vis < _VISIBILITY_REP_MIN:
-            return False
         return True
 
     def _calculate_rep_quality(
@@ -527,7 +343,7 @@ class HysteresisRepCounter:
         form_score = max(0.0, 1.0 - len(self._form_violations) * 0.15)
         expected_range = self.upper_threshold - self.lower_threshold
         actual_range = peak_value - trough_value
-        depth_score = min(1.0, actual_range / max(expected_range, 1))
+        depth_score = min(1.0, actual_range / max(expected_range, 1.0))
         if 2.0 <= duration <= 4.0:
             tempo_score = 1.0
         elif duration < 1.0:
@@ -537,7 +353,9 @@ class HysteresisRepCounter:
         else:
             tempo_score = 0.85
         if self._left_angle > 0 and self._right_angle > 0:
-            symmetry_score = max(0.0, 1.0 - abs(self._left_angle - self._right_angle) / 30)
+            symmetry_score = max(
+                0.0, 1.0 - abs(self._left_angle - self._right_angle) / 30.0
+            )
         else:
             symmetry_score = 1.0
         return RepQuality(
@@ -546,6 +364,12 @@ class HysteresisRepCounter:
             tempo_score=tempo_score,
             symmetry_score=symmetry_score,
         )
+
+    def record_violations(self, violations: list[str]) -> None:
+        self._form_violations.extend(violations)
+
+    def reset(self) -> None:
+        self._reset_state()
 
     @property
     def rep_count(self) -> int:
@@ -575,41 +399,15 @@ class HysteresisRepCounter:
 
     @property
     def smoothed_angle(self) -> float:
-        return self._smoothed_angle
+        return float(self._ema_angle) if self._ema_angle is not None else 0.0
 
     @property
     def velocity_dps(self) -> float:
         return self._velocity_dps
 
-    def reset(self) -> None:
-        self._phase = RepPhase.IDLE
-        self._rep_count = 0
-        self._partial_rep_count = 0
-        self._angles.clear()
-        self._timestamps.clear()
-        self._visibilities.clear()
-        self._frame_idx = 0
-        self._buffer_start_idx = 0
-        self._last_trough_idx = -1
-        self._last_peak_idx = -1
-        self._pending_trough_idx = None
-        self._pending_trough_value = 180.0
-        self._pending_trough_min_vis = 1.0
-        self._last_peak_value = None
-        self._last_peak_time = None
-        self._threshold_in_rep = False
-        self._threshold_start_time = None
-        self._threshold_min_angle = 180.0
-        self._threshold_min_vis = 1.0
-        self._reps.clear()
-        self._form_violations.clear()
-        self._low_visibility_streak = 0
-        self._smoothed_angle = 0.0
-        self._velocity_dps = 0.0
-
 
 def _params_for(exercise_key: str) -> dict[str, Any]:
-    """Look up REP_DETECTION overrides for an exercise key."""
+    """Look up REP_DETECTION overrides for an exercise key (legacy compat)."""
     try:
         from config.settings import settings
     except Exception:
@@ -625,8 +423,8 @@ class ExerciseRepCounter:
     def create_bicep_curl_counter() -> HysteresisRepCounter:
         return HysteresisRepCounter(
             upper_threshold=150,
-            lower_threshold=50,
-            min_rep_duration=0.8,
+            lower_threshold=70,
+            min_rep_duration=0.4,
             max_rep_duration=8.0,
             **_params_for("bicep_curl"),
         )
@@ -635,8 +433,8 @@ class ExerciseRepCounter:
     def create_squat_counter() -> HysteresisRepCounter:
         return HysteresisRepCounter(
             upper_threshold=160,
-            lower_threshold=90,
-            min_rep_duration=1.0,
+            lower_threshold=100,
+            min_rep_duration=0.5,
             max_rep_duration=10.0,
             **_params_for("squat"),
         )
@@ -645,8 +443,8 @@ class ExerciseRepCounter:
     def create_pushup_counter() -> HysteresisRepCounter:
         return HysteresisRepCounter(
             upper_threshold=155,
-            lower_threshold=90,
-            min_rep_duration=0.8,
+            lower_threshold=100,
+            min_rep_duration=0.4,
             max_rep_duration=8.0,
             **_params_for("pushup"),
         )
