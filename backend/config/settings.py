@@ -1,7 +1,7 @@
 """Application settings with environment variable support."""
 
 import os
-from typing import Optional, List
+from typing import Any, ClassVar, Dict, Optional, List
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -98,6 +98,28 @@ class Settings(BaseSettings):
     MAX_CLIENT_ID_LENGTH: int = 80
     CORS_ALLOW_CREDENTIALS: bool = False
     CORS_ORIGIN_REGEX: Optional[str] = None
+
+    # Pipeline — Rep detection (Savitzky-Golay + find_peaks).
+    # Per-exercise overrides for the HysteresisRepCounter internals.
+    # smooth_window must be odd and > polyorder. prominence is in degrees;
+    # min_rep_frames is the minimum peak-to-peak distance (≈ 0.5s @ 20fps).
+    # ClassVar so pydantic-settings doesn't treat it as an env-loaded field.
+    REP_DETECTION: ClassVar[Dict[str, Dict[str, Any]]] = {
+        "squat":               {"prominence": 30.0, "min_rep_frames": 10, "smooth_window": 9},
+        "pushup":              {"prominence": 30.0, "min_rep_frames": 10, "smooth_window": 9},
+        "bicep_curl":          {"prominence": 25.0, "min_rep_frames": 8,  "smooth_window": 7},
+        "alternate_bicep_curl":{"prominence": 25.0, "min_rep_frames": 8,  "smooth_window": 7},
+    }
+
+    # Mid-video exercise switching. Allows handing off from one exercise to
+    # another in the same session without resetting. The switch is allowed
+    # when EITHER (a) the current rep counter has been idle/setup for
+    # EXERCISE_SWITCH_IDLE_SECONDS, OR (b) the current exercise's signal has
+    # collapsed below EXERCISE_DROP_THRESHOLD for EXERCISE_DROP_SECONDS while
+    # the candidate exercise's confidence is rising.
+    EXERCISE_SWITCH_IDLE_SECONDS: float = 0.75
+    EXERCISE_DROP_THRESHOLD: float = 0.35
+    EXERCISE_DROP_SECONDS: float = 1.0
     
     @property
     def CORS_ORIGINS(self) -> List[str]:

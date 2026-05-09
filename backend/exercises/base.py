@@ -217,12 +217,32 @@ class BaseExercise(ABC):
         self._last_angles: Optional[JointAngles] = None
         self._rep_counter: Optional[HysteresisRepCounter] = None
 
-    def _create_rep_counter(self, upper_threshold: float, lower_threshold: float) -> HysteresisRepCounter:
+    def _create_rep_counter(
+        self,
+        upper_threshold: float,
+        lower_threshold: float,
+        *,
+        exercise_key: Optional[str] = None,
+        min_rep_duration: float = 0.5,
+        max_rep_duration: float = 10.0,
+    ) -> HysteresisRepCounter:
+        """Build a HysteresisRepCounter, merging per-exercise REP_DETECTION
+        params from settings when an `exercise_key` is supplied.
+        """
+        params: dict = {}
+        if exercise_key is not None:
+            try:
+                from config.settings import settings
+                cfg = getattr(settings, "REP_DETECTION", {}) or {}
+                params = dict(cfg.get(exercise_key, {}))
+            except Exception:
+                params = {}
         self._rep_counter = HysteresisRepCounter(
             upper_threshold=upper_threshold,
             lower_threshold=lower_threshold,
-            min_rep_duration=0.5,
-            max_rep_duration=10.0
+            min_rep_duration=min_rep_duration,
+            max_rep_duration=max_rep_duration,
+            **params,
         )
         return self._rep_counter
 

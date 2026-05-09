@@ -1,13 +1,22 @@
 """
-Advanced rep counting with hysteresis and state machine.
-Moved to pipeline package; utils/rep_counter.py re-exports from here.
+Rep counting via signal processing — Savitzky-Golay smoothing + scipy.find_peaks.
+
+Replaces the previous Schmitt-trigger threshold logic with a denoise-then-find-peaks
+pipeline. Public API is preserved, so callers (`exercises/*.py`,
+`state_machine/manager.py`) continue to work unchanged.
+
+Phase output is derived from the smoothed angle's first derivative; a single
+noisy frame near a threshold no longer flips the phase.
 """
 
 from enum import Enum
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 from collections import deque
 import time
+
+import numpy as np
+from scipy.signal import savgol_filter, find_peaks
 
 
 class RepPhase(str, Enum):
@@ -55,35 +64,106 @@ class RepData:
     timestamp: float = field(default_factory=time.time)
 
 
+# Defaults; per-exercise overrides come from settings.REP_DETECTION via the
+# exercise modules' constructor flow (see exercises/base.py:_create_rep_counter).
+_DEFAULT_SMOOTH_WINDOW = 9
+_DEFAULT_POLYORDER = 3
+_DEFAULT_PROMINENCE = 25.0          # degrees
+_DEFAULT_MIN_REP_FRAMES = 8         # peak-to-peak minimum distance
+
+# Velocity thresholds for phase output (degrees / second).
+_VELOCITY_HOLD_THRESHOLD = 8.0
+_VELOCITY_DIR_THRESHOLD = 4.0
+
+# Visibility-based abort. The previous "3 frames < 0.3" rule killed reps on
+# transient occlusion; this version requires a longer streak at a stricter
+# threshold AND a per-rep minimum, so single bad frames never poison a rep.
+_VISIBILITY_ABORT_THRESHOLD = 0.2
+_VISIBILITY_ABORT_FRAMES = 6
+_VISIBILITY_REP_MIN = 0.25
+
+
 class HysteresisRepCounter:
+    """Drop-in rep counter — same public surface as before, smarter internals.
+
+    Public surface preserved:
+      - constructor: upper_threshold, lower_threshold, min_rep_duration,
+        max_rep_duration, require_full_extension
+      - .update(angle, left_angle, right_angle, form_violations, visibility)
+        -> (RepPhase, rep_completed: bool)
+      - .rep_count, .partial_reps, .phase, .phase_str, .last_rep,
+        .average_quality, .reset(), .record_violations()
+
+    New optional kwargs (with sensible defaults so existing call sites keep
+    working): smooth_window, polyorder, prominence, min_rep_frames.
+    """
+
     def __init__(
         self,
         upper_threshold: float,
         lower_threshold: float,
         min_rep_duration: float = 0.5,
         max_rep_duration: float = 10.0,
-        require_full_extension: bool = True
+        require_full_extension: bool = True,
+        *,
+        smooth_window: int = _DEFAULT_SMOOTH_WINDOW,
+        polyorder: int = _DEFAULT_POLYORDER,
+        prominence: float = _DEFAULT_PROMINENCE,
+        min_rep_frames: int = _DEFAULT_MIN_REP_FRAMES,
     ):
-        self.upper_threshold = upper_threshold
-        self.lower_threshold = lower_threshold
-        self.min_rep_duration = min_rep_duration
-        self.max_rep_duration = max_rep_duration
-        self.require_full_extension = require_full_extension
+        self.upper_threshold = float(upper_threshold)
+        self.lower_threshold = float(lower_threshold)
+        self.min_rep_duration = float(min_rep_duration)
+        self.max_rep_duration = float(max_rep_duration)
+        self.require_full_extension = bool(require_full_extension)
 
-        self._phase = RepPhase.IDLE
-        self._rep_count = 0
-        self._partial_rep_count = 0
-        self._rep_start_time: Optional[float] = None
-        self._min_angle_in_rep: float = 180.0
-        self._max_angle_in_rep: float = 0.0
-        self._angle_history: deque[float] = deque(maxlen=30)
+        # savgol_filter requires an odd window strictly greater than polyorder.
+        sw = int(smooth_window)
+        if sw % 2 == 0:
+            sw += 1
+        po = int(polyorder)
+        if po >= sw:
+            po = sw - 1
+        self.smooth_window = sw
+        self.polyorder = po
+        self.prominence = float(prominence)
+        self.min_rep_frames = max(2, int(min_rep_frames))
+
+        # Rolling buffer ~3s @ 20fps so find_peaks has room to register a full
+        # cycle even after smoothing-edge effects.
+        self._buffer_size = max(60, self.smooth_window * 6)
+        self._angles: deque = deque(maxlen=self._buffer_size)
+        self._timestamps: deque = deque(maxlen=self._buffer_size)
+        self._visibilities: deque = deque(maxlen=self._buffer_size)
+
+        # Monotonic global frame index — survives buffer rotation so we can
+        # tell whether a peak/trough returned by find_peaks is one we've
+        # already counted.
+        self._frame_idx: int = 0
+        self._buffer_start_idx: int = 0  # global idx of self._angles[0]
+
+        # Pending-rep bookkeeping.
+        self._last_trough_idx: int = -1
+        self._last_peak_idx: int = -1
+        self._pending_trough_idx: Optional[int] = None
+        self._pending_trough_value: float = 180.0
+        self._pending_trough_min_vis: float = 1.0
+        self._last_peak_value: Optional[float] = None
+        self._last_peak_time: Optional[float] = None
+
+        # Output state.
+        self._phase: RepPhase = RepPhase.IDLE
+        self._rep_count: int = 0
+        self._partial_rep_count: int = 0
         self._reps: list[RepData] = []
         self._form_violations: list[str] = []
         self._left_angle: float = 0.0
         self._right_angle: float = 0.0
-        self._has_seen_upper: bool = False
-        self._min_visibility_in_rep: float = 1.0
         self._low_visibility_streak: int = 0
+
+        # Cached for callers that want to inspect the smoothed signal.
+        self._smoothed_angle: float = 0.0
+        self._velocity_dps: float = 0.0
 
     def update(
         self,
@@ -93,127 +173,269 @@ class HysteresisRepCounter:
         form_violations: Optional[list[str]] = None,
         visibility: Optional[float] = None,
     ) -> tuple[RepPhase, bool]:
-        self._angle_history.append(angle)
-        self._min_angle_in_rep = min(self._min_angle_in_rep, angle)
-        self._max_angle_in_rep = max(self._max_angle_in_rep, angle)
-
+        now = time.time()
+        self._frame_idx += 1
+        # Track which global frame index now corresponds to buffer[0].
+        if len(self._angles) == self._buffer_size:
+            self._buffer_start_idx += 1
+        elif len(self._angles) == 0:
+            self._buffer_start_idx = self._frame_idx
+        self._angles.append(float(angle))
+        self._timestamps.append(now)
+        self._visibilities.append(float(visibility) if visibility is not None else 1.0)
         if left_angle is not None:
-            self._left_angle = left_angle
+            self._left_angle = float(left_angle)
         if right_angle is not None:
-            self._right_angle = right_angle
+            self._right_angle = float(right_angle)
         if form_violations:
             self._form_violations.extend(form_violations)
 
-        # Visibility gating: if required joints drop out of frame, abort the
-        # in-flight rep. Prevents counting partial reps when the user steps
-        # out and back into view mid-set.
+        # Soft visibility-abort: only triggers on a sustained streak at a
+        # stricter threshold than the old logic, so transient occlusion is
+        # tolerated and only true frame-exits kill a pending rep.
         if visibility is not None:
-            self._min_visibility_in_rep = min(self._min_visibility_in_rep, visibility)
-            if visibility < 0.3:
+            if visibility < _VISIBILITY_ABORT_THRESHOLD:
                 self._low_visibility_streak += 1
-                if self._low_visibility_streak >= 3 and self._phase in (
-                    RepPhase.ECCENTRIC,
-                    RepPhase.CONCENTRIC,
+                if (
+                    self._low_visibility_streak >= _VISIBILITY_ABORT_FRAMES
+                    and self._pending_trough_idx is not None
                 ):
+                    self._pending_trough_idx = None
                     self._phase = RepPhase.READY
-                    self._min_angle_in_rep = 180.0
-                    self._max_angle_in_rep = 0.0
-                    self._min_visibility_in_rep = 1.0
-                    self._rep_start_time = time.time()
-                    self._form_violations = []
-                    return self._phase, False
             else:
                 self._low_visibility_streak = 0
 
-        current_time = time.time()
-        rep_completed = False
-        if angle >= self.upper_threshold:
-            self._has_seen_upper = True
-
-        if self._phase == RepPhase.IDLE:
-            # Start in READY - wait for user to reach extended position before counting down
-            self._phase = RepPhase.READY
-            self._rep_start_time = current_time
-            self._min_angle_in_rep = angle
-            self._max_angle_in_rep = angle
-
-        elif self._phase == RepPhase.READY:
-            # READY: Waiting for the motion to start (angle must go down first)
-            # Only transition to ECCENTRIC if angle goes DOWN from upper threshold
-            if angle < self.upper_threshold and (
-                self._has_seen_upper or angle > self.lower_threshold
-            ):
-                self._phase = RepPhase.ECCENTRIC
-                self._rep_start_time = current_time
-                self._min_angle_in_rep = angle
-                self._max_angle_in_rep = angle
-                self._form_violations = []
-
-        elif self._phase == RepPhase.ECCENTRIC:
-            # ECCENTRIC (down): Going from extended to contracted
-            # Transition to CONCENTRIC when reaching lower threshold
-            if angle < self.lower_threshold:
-                self._phase = RepPhase.CONCENTRIC
-            # If we somehow go back up without reaching lower, go back to READY
-            elif angle > self.upper_threshold + 5:
+        # Until the smoothing window is full, fall back to a simple "engaged"
+        # output so the upstream UI sees a phase string. No reps can be
+        # counted until we have at least one full smoothing window of data.
+        if len(self._angles) < self.smooth_window:
+            self._smoothed_angle = float(angle)
+            self._velocity_dps = 0.0
+            if self._phase == RepPhase.IDLE:
                 self._phase = RepPhase.READY
+            return self._phase, False
 
-        elif self._phase == RepPhase.CONCENTRIC:
-            # CONCENTRIC (up): Going from contracted back to extended
-            # Complete rep when returning to upper threshold
-            if angle > self.upper_threshold:
-                rep_duration = current_time - (self._rep_start_time or current_time)
-                if self._is_valid_rep(rep_duration):
-                    self._rep_count += 1
-                    rep_completed = True
-                    quality = self._calculate_rep_quality(rep_duration)
-                    self._reps.append(RepData(
-                        rep_number=self._rep_count,
-                        quality=quality,
-                        duration_seconds=rep_duration,
-                        min_angle=self._min_angle_in_rep,
-                        max_angle=self._max_angle_in_rep
-                    ))
-                else:
-                    self._partial_rep_count += 1
-                self._phase = RepPhase.READY
-                self._min_angle_in_rep = 180.0
-                self._max_angle_in_rep = 0.0
-                self._min_visibility_in_rep = 1.0
-                self._rep_start_time = current_time
-                self._form_violations = []
+        arr = np.fromiter(self._angles, dtype=float)
+        ts_arr = np.fromiter(self._timestamps, dtype=float)
 
-        # Timeout: If rep is taking too long, reset to READY
-        if self._rep_start_time and (current_time - self._rep_start_time) > self.max_rep_duration:
-            if self._phase in [RepPhase.ECCENTRIC, RepPhase.CONCENTRIC]:
-                self._phase = RepPhase.READY
-                self._rep_start_time = current_time
+        smoothed = savgol_filter(
+            arr, window_length=self.smooth_window, polyorder=self.polyorder
+        )
+        velocity_per_sample = savgol_filter(
+            arr,
+            window_length=self.smooth_window,
+            polyorder=self.polyorder,
+            deriv=1,
+        )
+        # Convert deg/sample to deg/second using the local mean dt.
+        win = min(self.smooth_window, len(ts_arr))
+        dts = np.diff(ts_arr[-win:])
+        mean_dt = float(np.mean(dts)) if dts.size > 0 and float(np.mean(dts)) > 0 else 1.0 / 20.0
+        self._smoothed_angle = float(smoothed[-1])
+        self._velocity_dps = float(velocity_per_sample[-1]) / max(mean_dt, 1e-3)
 
+        # Phase from velocity sign with a small "hold" band to suppress jitter.
+        v = self._velocity_dps
+        if abs(v) < _VELOCITY_HOLD_THRESHOLD:
+            new_phase = RepPhase.HOLD if self._phase != RepPhase.IDLE else RepPhase.READY
+        elif v < -_VELOCITY_DIR_THRESHOLD:
+            new_phase = RepPhase.ECCENTRIC
+        elif v > _VELOCITY_DIR_THRESHOLD:
+            new_phase = RepPhase.CONCENTRIC
+        else:
+            new_phase = self._phase if self._phase != RepPhase.IDLE else RepPhase.READY
+        self._phase = new_phase
+
+        rep_completed = self._scan_for_completed_rep(smoothed, ts_arr)
+        # Plateau finalizer: if a rep ended at a sustained "hold at top" the
+        # smoothed signal rises into a plateau without a descent — find_peaks
+        # cannot register a peak there. Detect rising→plateau as a rep end
+        # so the last rep of a set isn't dropped.
+        if not rep_completed and self._pending_trough_idx is not None:
+            rep_completed = self._maybe_finalize_plateau_rep(smoothed, ts_arr)
         return self._phase, rep_completed
 
+    def _maybe_finalize_plateau_rep(
+        self, smoothed: np.ndarray, ts_arr: np.ndarray
+    ) -> bool:
+        """Close out a rep when velocity decays from positive to ~0 with the
+        smoothed angle past upper_threshold.
+
+        Triggered when the user holds at the top of the rep (e.g. end of a set
+        or brief pause between reps where they don't fully reset).
+        """
+        if abs(self._velocity_dps) > _VELOCITY_HOLD_THRESHOLD * 0.6:
+            return False
+        if self._smoothed_angle < self.upper_threshold:
+            return False
+        # Confirm there was a clear rising trend in the recent window.
+        win = min(self.smooth_window, len(smoothed) - 1)
+        if win < 3:
+            return False
+        recent_delta = float(smoothed[-1] - smoothed[-win - 1])
+        if recent_delta < self.prominence * 0.5:
+            return False
+
+        # Use the current frame's smoothed angle / time as the peak.
+        peak_value = float(self._smoothed_angle)
+        peak_time = float(ts_arr[-1])
+        peak_global = self._buffer_start_idx + (len(smoothed) - 1)
+        if peak_global <= self._last_peak_idx:
+            return False
+
+        start_time = (
+            self._last_peak_time
+            if self._last_peak_time is not None
+            else float(ts_arr[0])
+        )
+        rep_duration = peak_time - start_time
+
+        if self._is_valid_rep(
+            duration=rep_duration,
+            peak_value=peak_value,
+            trough_value=self._pending_trough_value,
+            min_vis=self._pending_trough_min_vis,
+        ):
+            self._rep_count += 1
+            self._reps.append(
+                RepData(
+                    rep_number=self._rep_count,
+                    quality=self._calculate_rep_quality(
+                        rep_duration, peak_value, self._pending_trough_value
+                    ),
+                    duration_seconds=rep_duration,
+                    min_angle=self._pending_trough_value,
+                    max_angle=peak_value,
+                )
+            )
+            self._last_peak_idx = peak_global
+            self._last_peak_value = peak_value
+            self._last_peak_time = peak_time
+            self._pending_trough_idx = None
+            self._form_violations = []
+            return True
+        return False
+
+    def _scan_for_completed_rep(
+        self, smoothed: np.ndarray, ts_arr: np.ndarray
+    ) -> bool:
+        """Find a newly-completed rep using find_peaks on the smoothed signal.
+
+        A rep = trough (joint flexed) followed by peak (joint extended). We
+        re-run find_peaks every frame; on a 60-sample buffer this is sub-ms.
+        Global frame indices ensure we never count the same trough/peak twice
+        even as the rolling buffer slides.
+        """
+        peaks_local, _ = find_peaks(
+            smoothed,
+            distance=self.min_rep_frames,
+            prominence=self.prominence,
+        )
+        troughs_local, _ = find_peaks(
+            -smoothed,
+            distance=self.min_rep_frames,
+            prominence=self.prominence,
+        )
+
+        # Step 1: register any new trough beyond the last consumed one.
+        for t_local in troughs_local:
+            t_global = self._buffer_start_idx + int(t_local)
+            if t_global <= self._last_trough_idx:
+                continue
+            # Trough must come after the last completed peak — preserves the
+            # alternating peak/trough sequence.
+            if self._last_peak_idx >= 0 and t_global <= self._last_peak_idx:
+                continue
+            self._pending_trough_idx = t_global
+            self._pending_trough_value = float(smoothed[t_local])
+            lo = max(0, int(t_local) - self.smooth_window)
+            hi = min(len(self._visibilities), int(t_local) + self.smooth_window + 1)
+            window_vis = list(self._visibilities)[lo:hi]
+            self._pending_trough_min_vis = (
+                float(min(window_vis)) if window_vis else 1.0
+            )
+            self._last_trough_idx = t_global
+
+        # Step 2: if a trough is pending, look for a subsequent peak.
+        rep_completed = False
+        if self._pending_trough_idx is not None:
+            for p_local in peaks_local:
+                p_global = self._buffer_start_idx + int(p_local)
+                if p_global <= self._last_peak_idx:
+                    continue
+                if p_global <= self._pending_trough_idx:
+                    continue
+                peak_value = float(smoothed[p_local])
+                peak_time = float(ts_arr[p_local])
+                start_time = (
+                    self._last_peak_time
+                    if self._last_peak_time is not None
+                    else float(ts_arr[0])
+                )
+                rep_duration = peak_time - start_time
+
+                if self._is_valid_rep(
+                    duration=rep_duration,
+                    peak_value=peak_value,
+                    trough_value=self._pending_trough_value,
+                    min_vis=self._pending_trough_min_vis,
+                ):
+                    self._rep_count += 1
+                    rep_completed = True
+                    quality = self._calculate_rep_quality(
+                        rep_duration, peak_value, self._pending_trough_value
+                    )
+                    self._reps.append(
+                        RepData(
+                            rep_number=self._rep_count,
+                            quality=quality,
+                            duration_seconds=rep_duration,
+                            min_angle=self._pending_trough_value,
+                            max_angle=peak_value,
+                        )
+                    )
+                else:
+                    self._partial_rep_count += 1
+
+                self._last_peak_idx = p_global
+                self._last_peak_value = peak_value
+                self._last_peak_time = peak_time
+                self._pending_trough_idx = None
+                self._form_violations = []
+                # One rep per update() — multiple new peaks in one frame
+                # would be physically impossible at 20fps anyway.
+                break
+
+        return rep_completed
+
     def record_violations(self, violations: list[str]) -> None:
-        """Append form violations for the in-progress rep (called after form check)."""
         self._form_violations.extend(violations)
 
-    def _is_valid_rep(self, duration: float) -> bool:
+    def _is_valid_rep(
+        self,
+        *,
+        duration: float,
+        peak_value: float,
+        trough_value: float,
+        min_vis: float,
+    ) -> bool:
         if duration < self.min_rep_duration or duration > self.max_rep_duration:
             return False
         if self.require_full_extension:
-            if self._max_angle_in_rep < self.upper_threshold:
+            if peak_value < self.upper_threshold:
                 return False
-            if self._min_angle_in_rep > self.lower_threshold:
+            if trough_value > self.lower_threshold:
                 return False
-        # NB: do NOT reject on per-rep minimum visibility. MediaPipe routinely
-        # reports 0.4–0.6 visibility for partly-occluded but clearly-visible
-        # joints; a single low-visibility frame would poison the entire rep.
-        # The 3-frame "vis < 0.3" streak abort in update() already handles
-        # the real failure mode (user steps out of frame).
+        if min_vis < _VISIBILITY_REP_MIN:
+            return False
         return True
 
-    def _calculate_rep_quality(self, duration: float) -> RepQuality:
+    def _calculate_rep_quality(
+        self, duration: float, peak_value: float, trough_value: float
+    ) -> RepQuality:
         form_score = max(0.0, 1.0 - len(self._form_violations) * 0.15)
         expected_range = self.upper_threshold - self.lower_threshold
-        actual_range = self._max_angle_in_rep - self._min_angle_in_rep
+        actual_range = peak_value - trough_value
         depth_score = min(1.0, actual_range / max(expected_range, 1))
         if 2.0 <= duration <= 4.0:
             tempo_score = 1.0
@@ -228,8 +450,10 @@ class HysteresisRepCounter:
         else:
             symmetry_score = 1.0
         return RepQuality(
-            form_score=form_score, depth_score=depth_score,
-            tempo_score=tempo_score, symmetry_score=symmetry_score
+            form_score=form_score,
+            depth_score=depth_score,
+            tempo_score=tempo_score,
+            symmetry_score=symmetry_score,
         )
 
     @property
@@ -258,33 +482,76 @@ class HysteresisRepCounter:
     def last_rep(self) -> Optional[RepData]:
         return self._reps[-1] if self._reps else None
 
-    def reset(self):
+    @property
+    def smoothed_angle(self) -> float:
+        return self._smoothed_angle
+
+    @property
+    def velocity_dps(self) -> float:
+        return self._velocity_dps
+
+    def reset(self) -> None:
         self._phase = RepPhase.IDLE
         self._rep_count = 0
         self._partial_rep_count = 0
-        self._rep_start_time = None
-        self._min_angle_in_rep = 180.0
-        self._max_angle_in_rep = 0.0
-        self._angle_history.clear()
+        self._angles.clear()
+        self._timestamps.clear()
+        self._visibilities.clear()
+        self._frame_idx = 0
+        self._buffer_start_idx = 0
+        self._last_trough_idx = -1
+        self._last_peak_idx = -1
+        self._pending_trough_idx = None
+        self._pending_trough_value = 180.0
+        self._pending_trough_min_vis = 1.0
+        self._last_peak_value = None
+        self._last_peak_time = None
         self._reps.clear()
         self._form_violations.clear()
-        self._has_seen_upper = False
-        self._min_visibility_in_rep = 1.0
         self._low_visibility_streak = 0
+        self._smoothed_angle = 0.0
+        self._velocity_dps = 0.0
+
+
+def _params_for(exercise_key: str) -> dict[str, Any]:
+    """Look up REP_DETECTION overrides for an exercise key."""
+    try:
+        from config.settings import settings
+    except Exception:
+        return {}
+    cfg = getattr(settings, "REP_DETECTION", {}) or {}
+    return dict(cfg.get(exercise_key, {}))
 
 
 class ExerciseRepCounter:
+    """Optional convenience factories — modules use exercises.base directly."""
+
     @staticmethod
     def create_bicep_curl_counter() -> HysteresisRepCounter:
-        return HysteresisRepCounter(upper_threshold=150, lower_threshold=50,
-                                    min_rep_duration=0.8, max_rep_duration=8.0)
+        return HysteresisRepCounter(
+            upper_threshold=150,
+            lower_threshold=50,
+            min_rep_duration=0.8,
+            max_rep_duration=8.0,
+            **_params_for("bicep_curl"),
+        )
 
     @staticmethod
     def create_squat_counter() -> HysteresisRepCounter:
-        return HysteresisRepCounter(upper_threshold=160, lower_threshold=90,
-                                    min_rep_duration=1.0, max_rep_duration=10.0)
+        return HysteresisRepCounter(
+            upper_threshold=160,
+            lower_threshold=90,
+            min_rep_duration=1.0,
+            max_rep_duration=10.0,
+            **_params_for("squat"),
+        )
 
     @staticmethod
     def create_pushup_counter() -> HysteresisRepCounter:
-        return HysteresisRepCounter(upper_threshold=155, lower_threshold=90,
-                                    min_rep_duration=0.8, max_rep_duration=8.0)
+        return HysteresisRepCounter(
+            upper_threshold=155,
+            lower_threshold=90,
+            min_rep_duration=0.8,
+            max_rep_duration=8.0,
+            **_params_for("pushup"),
+        )

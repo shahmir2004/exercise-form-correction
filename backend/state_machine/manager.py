@@ -114,6 +114,11 @@ class FormManager:
         self._pending_frames: int = 0
         self._pending_since: Optional[float] = None
         self._is_stationary: bool = False
+        # Mid-video switching aids: track how long the current rep phase has
+        # been in a safe-to-switch state, and how long the current exercise's
+        # candidate confidence has been below the drop threshold.
+        self._safe_phase_since: Optional[float] = None
+        self._current_below_drop_since: Optional[float] = None
 
     def process_frame(self, landmarks: list[dict]) -> FormManagerState:
         """Process a single frame."""
@@ -315,6 +320,9 @@ class FormManager:
             self._current_variant = _EX_TYPE_TO_NAME.get(exercise_type)
             self._exercise_source = source
             self._last_rep_count = 0
+            self._last_rep_phase = "idle"
+            self._safe_phase_since = None
+            self._current_below_drop_since = None
             _logger.info(
                 "exercise %s -> %s (source=%s, frame=%d)",
                 previous,
@@ -329,9 +337,33 @@ class FormManager:
         self._pending_since = None
 
     def _is_safe_to_switch(self) -> bool:
-        # Only swap exercise modules when the rep counter is between reps.
-        # Mid-rep swapping causes phantom reps in the new module.
-        return self._last_rep_phase in ("idle", "setup")
+        """Allow swapping the active exercise module under any of:
+
+        1. Rep counter is currently in a between-rep phase (idle/setup/hold).
+           "hold" is now safe because the velocity-based rep counter emits it
+           at the top/bottom plateau of every rep, where no rep is in flight.
+        2. Rep counter has been in a between-rep phase for at least
+           EXERCISE_SWITCH_IDLE_SECONDS — absorbs brief noise dips in phase.
+        3. The candidate exercise has been a different exercise from the
+           current one for EXERCISE_DROP_SECONDS while the system has been
+           consistently producing signal — the user has clearly moved on, so
+           swapping despite a phantom-in-flight phase is the right call.
+        """
+        between_reps_now = self._last_rep_phase in ("idle", "setup", "hold")
+        if between_reps_now:
+            return True
+        now = time.time()
+        if (
+            self._safe_phase_since is not None
+            and (now - self._safe_phase_since) >= settings.EXERCISE_SWITCH_IDLE_SECONDS
+        ):
+            return True
+        if (
+            self._current_below_drop_since is not None
+            and (now - self._current_below_drop_since) >= settings.EXERCISE_DROP_SECONDS
+        ):
+            return True
+        return False
 
     def _apply_rule_gate(
         self,
@@ -414,6 +446,31 @@ class FormManager:
         new_sys_state: SystemState,
         signal_quality: str,
     ) -> None:
+        # Track time spent in a safe-to-switch rep phase. The new
+        # velocity-based counter emits "hold" at top/bottom plateaus, which
+        # is also a safe-to-swap moment.
+        now = time.time()
+        if self._last_rep_phase in ("idle", "setup", "hold"):
+            if self._safe_phase_since is None:
+                self._safe_phase_since = now
+        else:
+            self._safe_phase_since = None
+
+        # Track how long the system has consistently been suggesting a
+        # *different* exercise from the active one — this is the "user
+        # transitioned" signal that lets us override a phantom in-flight
+        # phase in the current module's rep counter.
+        if (
+            self._active_module is not None
+            and candidate_exercise is not None
+            and candidate_exercise != self._current_exercise
+            and candidate_conf >= settings.EXERCISE_SWITCH_CONFIDENCE
+        ):
+            if self._current_below_drop_since is None:
+                self._current_below_drop_since = now
+        else:
+            self._current_below_drop_since = None
+
         if (
             candidate_exercise is None
             or new_sys_state in (SystemState.IDLE, SystemState.STATIONARY)
@@ -521,6 +578,8 @@ class FormManager:
         self._last_rep_phase = "idle"
         self._last_rep_count = 0
         self._is_stationary = False
+        self._safe_phase_since = None
+        self._current_below_drop_since = None
         self._validator.reset()
         self._kalman.reset()
         self._feature_extractor.reset()

@@ -40,7 +40,10 @@ class SquatModule(BaseExercise):
         # Create hysteresis-based rep counter for stable counting
         self._create_rep_counter(
             upper_threshold=self.MAX_KNEE_ANGLE - 10,  # ~150 degrees (standing)
-            lower_threshold=self.MIN_KNEE_ANGLE + 20   # ~90 degrees (parallel)
+            lower_threshold=self.MIN_KNEE_ANGLE + 20,  # ~90 degrees (parallel)
+            exercise_key="squat",
+            min_rep_duration=1.0,
+            max_rep_duration=10.0,
         )
     
     @property

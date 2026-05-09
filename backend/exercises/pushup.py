@@ -40,7 +40,10 @@ class PushupModule(BaseExercise):
         # Create hysteresis-based rep counter for stable counting
         self._create_rep_counter(
             upper_threshold=self.MAX_ELBOW_ANGLE - 10,  # ~150 degrees (arms extended)
-            lower_threshold=self.MIN_ELBOW_ANGLE + 20   # ~90 degrees (bottom of push-up)
+            lower_threshold=self.MIN_ELBOW_ANGLE + 20,  # ~90 degrees (bottom of push-up)
+            exercise_key="pushup",
+            min_rep_duration=0.8,
+            max_rep_duration=8.0,
         )
     
     @property

@@ -1,7 +1,6 @@
 """Bicep curl exercise module with form correction."""
 
 from typing import Optional
-from collections import deque
 import numpy as np
 from .base import (
     BaseExercise,
@@ -50,13 +49,13 @@ class BicepCurlModule(BaseExercise):
     WRIST_CURL_THRESHOLD = 20
 
     MIN_VISIBILITY = 0.3
-    SMOOTHING_WINDOW = 5
     MIN_FRAMES_TO_CONFIRM = 3
     # Rep counter ROM gate. The previous 140°/130° (10° band) accepted
     # micro-movements as reps; the briefly-tried 160°/60° required near-
-    # perfect ROM and never registered through the 5-frame angle smoother.
-    # 150°/80° = 70° band, achievable for normal curls (peak elbow ~70°
-    # smooths to ~75°; peak extension ~165° smooths to ~160°).
+    # perfect ROM. 150°/80° = 70° band — achievable for normal curls and
+    # passes find_peaks prominence (25°) cleanly. The new rep counter
+    # smooths internally via Savitzky-Golay, so no per-module pre-smoother
+    # is needed (used to add ~250ms phase-transition lag).
     REP_EXTENDED_THRESHOLD = 150
     REP_CONTRACTED_THRESHOLD = 80
     
@@ -74,26 +73,24 @@ class BicepCurlModule(BaseExercise):
         self._initial_shoulder_y: Optional[float] = None
         self._active_arm: Optional[str] = None  # "left", "right", or "both"
         self._is_seated: bool = False  # Track if user is seated
-        
-        # Smoothing buffers for angle readings
-        self._left_elbow_buffer: deque = deque(maxlen=self.SMOOTHING_WINDOW)
-        self._right_elbow_buffer: deque = deque(maxlen=self.SMOOTHING_WINDOW)
-        
+
         # State confirmation counters
         self._curl_confirm_count = 0
         self._extend_confirm_count = 0
         self._pending_state_change: Optional[str] = None
-        
+
         # Seated detection buffer
         self._seated_frame_count = 0
-        
-        # Create hysteresis-based rep counter for stable counting
+
+        # Rep counter: Savitzky-Golay smoothing + find_peaks lives inside
+        # HysteresisRepCounter, so no per-module pre-smoothing is needed.
         self._create_rep_counter(
             upper_threshold=self.REP_EXTENDED_THRESHOLD,
             lower_threshold=self.REP_CONTRACTED_THRESHOLD,
+            exercise_key="bicep_curl",
+            min_rep_duration=0.3,
+            max_rep_duration=8.0,
         )
-        if self._rep_counter:
-            self._rep_counter.min_rep_duration = 0.3
     
     @property
     def name(self) -> str:
@@ -172,34 +169,33 @@ class BicepCurlModule(BaseExercise):
             return False
     
     def _calculate_angles(self, landmarks: dict[JointName, Landmark]) -> JointAngles:
-        """Calculate all relevant joint angles for bicep curl analysis with smoothing."""
+        """Calculate all relevant joint angles for bicep curl analysis.
+
+        Raw angles are fed straight to the rep counter; HysteresisRepCounter's
+        Savitzky-Golay window handles smoothing and computes velocity for
+        phase output. Pre-smoothing here on top of that used to delay phase
+        transitions by ~250ms.
+        """
         angles = JointAngles()
-        
-        # Check visibility before calculating
+
         left_visible = self._check_arm_visibility(landmarks, "left")
         right_visible = self._check_arm_visibility(landmarks, "right")
-        
-        # Left elbow angle (shoulder-elbow-wrist) with smoothing
+
         if left_visible:
-            raw_left = calculate_angle(
+            angles.left_elbow = calculate_angle(
                 landmarks[JointName.LEFT_SHOULDER],
                 landmarks[JointName.LEFT_ELBOW],
                 landmarks[JointName.LEFT_WRIST]
             )
-            self._left_elbow_buffer.append(raw_left)
-            angles.left_elbow = sum(self._left_elbow_buffer) / len(self._left_elbow_buffer)
         else:
             angles.left_elbow = 180.0  # Default extended
-        
-        # Right elbow angle with smoothing
+
         if right_visible:
-            raw_right = calculate_angle(
+            angles.right_elbow = calculate_angle(
                 landmarks[JointName.RIGHT_SHOULDER],
                 landmarks[JointName.RIGHT_ELBOW],
                 landmarks[JointName.RIGHT_WRIST]
             )
-            self._right_elbow_buffer.append(raw_right)
-            angles.right_elbow = sum(self._right_elbow_buffer) / len(self._right_elbow_buffer)
         else:
             angles.right_elbow = 180.0  # Default extended
         
@@ -506,8 +502,6 @@ class BicepCurlModule(BaseExercise):
         self._initial_shoulder_y = None
         self._active_arm = None
         self._is_seated = False
-        self._left_elbow_buffer.clear()
-        self._right_elbow_buffer.clear()
         self._curl_confirm_count = 0
         self._extend_confirm_count = 0
         self._pending_state_change = None
@@ -546,19 +540,23 @@ class AlternateBicepCurlModule(BicepCurlModule):
         self._frames_since_last_rep: int = 0
         self._max_frames_between_switch: int = 60  # ~2 seconds at 30fps
         
-        # Create separate rep counters for each arm
-        from pipeline.rep_counter import HysteresisRepCounter
+        # Per-arm rep counters. Each runs its own Savitzky-Golay smoother
+        # internally, so per-arm pre-smoothing is unnecessary.
+        from pipeline.rep_counter import HysteresisRepCounter, _params_for
+        params = _params_for("alternate_bicep_curl")
         self._left_rep_counter = HysteresisRepCounter(
             upper_threshold=self.REP_EXTENDED_THRESHOLD,
             lower_threshold=self.REP_CONTRACTED_THRESHOLD,
             min_rep_duration=0.2,
-            max_rep_duration=8.0
+            max_rep_duration=8.0,
+            **params,
         )
         self._right_rep_counter = HysteresisRepCounter(
             upper_threshold=self.REP_EXTENDED_THRESHOLD,
             lower_threshold=self.REP_CONTRACTED_THRESHOLD,
             min_rep_duration=0.2,
-            max_rep_duration=8.0
+            max_rep_duration=8.0,
+            **params,
         )
     
     @property
