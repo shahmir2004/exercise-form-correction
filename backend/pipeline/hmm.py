@@ -100,16 +100,25 @@ def _extract_obs_features(frame: BodyFrame, arm_asym_ema: float, elbow_flex_ema:
     knee_bent = min_knee < 120.0          # clearly bent (seated or deep squat)
     elbow_bent = min_elbow < 140.0        # arm curling
 
-    # Squat: knees bent, arms straight
-    knee_bent_no_curl = 1.0 if (knee_bent and not elbow_bent) else 0.0
+    # Seated posture: knees bent, hips low, torso fully vertical. A real
+    # squat has the torso leaning forward; a person sitting on a bench
+    # holds the torso roughly upright. Without this gate, sitting still
+    # before a seated curl looks identical to the bottom of a squat
+    # (knees bent + hips low + arms relaxed at sides) and the HMM locks
+    # in SQUAT before the curl motion begins.
+    is_seated = knee_bent and frame.hip_y > 0.55 and torso < 20.0
+
+    # Squat: knees bent, arms straight, AND not seated.
+    knee_bent_no_curl = 1.0 if (knee_bent and not elbow_bent and not is_seated) else 0.0
 
     # Standing curl: elbow bent, knees straight
     elbow_curl_no_knees = 1.0 if (elbow_bent and not knee_bent) else 0.0
 
     # Hip low: hips in lower half of frame. Used to be ANDed with min_knee>120
     # which made it false during the actual squat motion (knees at 70-110)
-    # — that bug penalized real squats. Drop the AND.
-    hip_y_low = 1.0 if frame.hip_y > 0.55 else 0.0
+    # — that bug penalized real squats. Drop the AND. Also suppressed
+    # during seated posture so sitting upright doesn't pump SQUAT evidence.
+    hip_y_low = 0.0 if is_seated else (1.0 if frame.hip_y > 0.55 else 0.0)
 
     obs = np.array([
         1.0 if frame.is_horizontal else 0.0,

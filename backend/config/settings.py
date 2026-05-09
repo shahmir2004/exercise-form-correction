@@ -15,9 +15,10 @@ def get_cors_origins() -> List[str]:
             return ["*"]
         return [origin.strip() for origin in env_value.split(',') if origin.strip()]
     return [
-        "http://localhost:3000", 
+        "http://localhost:3000",
         "http://localhost:5173",
         "https://exercise-form-correction.vercel.app",
+        "https://gymii.vercel.app",
     ]
 
 
