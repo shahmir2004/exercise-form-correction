@@ -722,8 +722,12 @@ class AlternateBicepCurlModule(BicepCurlModule):
         left_curled = angles.left_elbow < self.MIN_ELBOW_ANGLE + 30
         right_curled = angles.right_elbow < self.MIN_ELBOW_ANGLE + 30
         
-        # Warn if both arms are curling at the same time
-        if left_curled and right_curled:
+        # Warn if both arms are curling at the same time, but only after the
+        # user has actually completed at least one alternating rep. Otherwise
+        # this fires immediately when the classifier mis-locks regular bicep
+        # curls into the alternate module — the user is doing both arms
+        # together because that IS the exercise they want, not a form fault.
+        if left_curled and right_curled and self.rep_count >= 1:
             result.violations.append("Both arms curling together")
             result.corrections.append("Keep one arm extended while curling the other")
             result.joint_colors[JointName.LEFT_ELBOW.value] = "yellow"
